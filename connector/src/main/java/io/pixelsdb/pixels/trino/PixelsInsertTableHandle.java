@@ -5,6 +5,8 @@
  */
 package io.pixelsdb.pixels.trino;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import io.trino.spi.connector.ConnectorInsertTableHandle;
 
 import java.util.List;
@@ -23,17 +25,22 @@ public final class PixelsInsertTableHandle implements ConnectorInsertTableHandle
     private final PixelsTableHandle tableHandle;
     private final List<PixelsColumnHandle> columns;
 
-    public PixelsInsertTableHandle(PixelsTableHandle tableHandle, List<PixelsColumnHandle> columns)
+    @JsonCreator
+    public PixelsInsertTableHandle(
+            @JsonProperty("tableHandle") PixelsTableHandle tableHandle,
+            @JsonProperty("columns") List<PixelsColumnHandle> columns)
     {
         this.tableHandle = requireNonNull(tableHandle, "tableHandle is null");
         this.columns = List.copyOf(requireNonNull(columns, "columns is null"));
     }
 
+    @JsonProperty
     public PixelsTableHandle getTableHandle()
     {
         return tableHandle;
     }
 
+    @JsonProperty
     public List<PixelsColumnHandle> getColumns()
     {
         return columns;

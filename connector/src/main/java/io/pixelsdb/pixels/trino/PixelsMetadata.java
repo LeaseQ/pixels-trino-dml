@@ -30,6 +30,7 @@ import io.airlift.json.JsonCodecFactory;
 import io.airlift.json.ObjectMapperProvider;
 import io.airlift.log.Logger;
 import io.pixelsdb.pixels.common.exception.MetadataException;
+import io.pixelsdb.pixels.common.exception.SinglePointIndexException;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.metadata.domain.*;
 import io.pixelsdb.pixels.common.physical.Storage;
@@ -40,6 +41,7 @@ import io.pixelsdb.pixels.core.stats.RangeStats;
 import io.pixelsdb.pixels.core.stats.StatsRecorder;
 import io.pixelsdb.pixels.daemon.MetadataProto;
 import io.pixelsdb.pixels.executor.aggregation.FunctionType;
+import io.pixelsdb.pixels.index.rocksdb.PixelsTagIndex;
 import io.pixelsdb.pixels.planner.plan.logical.Table;
 import io.pixelsdb.pixels.trino.exception.PixelsErrorCode;
 import io.pixelsdb.pixels.trino.impl.PixelsMetadataProxy;
@@ -58,6 +60,7 @@ import io.trino.spi.statistics.TableStatistics;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import org.rocksdb.RocksDBException;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Verify.verify;
@@ -302,7 +305,176 @@ public class PixelsMetadata implements ConnectorMetadata
                     requirePixelsColumn(assignment.getKey()),
                     requireNonNull(assignment.getValue(), "assignment value is null"));
         }
-        return Optional.of(new PixelsUpdateTableHandle(pixelsTableHandle, pixelAssignments));
+        try
+        {
+            return Optional.of(new PixelsUpdateTableHandle(
+                    pixelsTableHandle, pixelAssignments, resolvePrimaryKeyColumns(pixelsTableHandle)));
+        }
+        catch (MetadataException e)
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
+                    "failed to resolve the Pixels UPDATE primary key", e);
+        }
+    }
+
+    @Override
+    public RowChangeParadigm getRowChangeParadigm(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle)
+    {
+        requirePixelsBaseTable(tableHandle);
+        return RowChangeParadigm.CHANGE_ONLY_UPDATED_COLUMNS;
+    }
+
+    @Override
+    public ColumnHandle getMergeRowIdColumnHandle(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle)
+    {
+        PixelsTableHandle pixelsTableHandle = requirePixelsBaseTable(tableHandle);
+        try
+        {
+            return new PixelsRowIdColumnHandle(resolvePrimaryKeyColumns(pixelsTableHandle).get(0));
+        }
+        catch (MetadataException e)
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
+                    "failed to resolve the Pixels UPDATE row id", e);
+        }
+    }
+
+    @Override
+    public ConnectorMergeTableHandle beginMerge(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle,
+            RetryMode retryMode)
+    {
+        return beginPixelsMerge(tableHandle, List.of());
+    }
+
+    @Override
+    public ConnectorMergeTableHandle beginMerge(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle,
+            Map<Integer, Collection<ColumnHandle>> updateAssignments,
+            RetryMode retryMode)
+    {
+        List<PixelsColumnHandle> updatedColumns = updateAssignments.values().stream()
+                .flatMap(Collection::stream)
+                .filter(PixelsColumnHandle.class::isInstance)
+                .map(PixelsColumnHandle.class::cast)
+                .distinct()
+                .toList();
+        return beginPixelsMerge(tableHandle, updatedColumns);
+    }
+
+    private ConnectorMergeTableHandle beginPixelsMerge(
+            ConnectorTableHandle tableHandle,
+            List<PixelsColumnHandle> updatedColumns)
+    {
+        PixelsTableHandle pixelsTableHandle = requirePixelsBaseTable(tableHandle);
+        try
+        {
+            io.pixelsdb.pixels.common.metadata.domain.Table table = metadataProxy.getMetadataService()
+                    .getTable(pixelsTableHandle.getSchemaName(), pixelsTableHandle.getTableName());
+            SinglePointIndex primaryIndex = metadataProxy.getMetadataService().getPrimaryIndex(table.getId());
+            if (primaryIndex == null)
+            {
+                throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                        "Pixels UPDATE requires a primary index on " + pixelsTableHandle.getSchemaTableName());
+            }
+            return new PixelsMergeTableHandle(
+                    pixelsTableHandle, table.getId(), primaryIndex.getId(),
+                    resolvePrimaryKeyColumns(pixelsTableHandle), updatedColumns);
+        }
+        catch (MetadataException e)
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
+                    "failed to begin Pixels UPDATE merge", e);
+        }
+    }
+
+    @Override
+    public void finishMerge(
+            ConnectorSession session,
+            ConnectorMergeTableHandle mergeHandle,
+            List<ConnectorTableHandle> sourceTableHandles,
+            Collection<io.airlift.slice.Slice> fragments,
+            Collection<io.trino.spi.statistics.ComputedStatistics> computedStatistics)
+    {
+        if (!(mergeHandle instanceof PixelsMergeTableHandle))
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                    "Pixels UPDATE received an invalid merge handle");
+        }
+    }
+
+    private List<PixelsColumnHandle> resolvePrimaryKeyColumns(PixelsTableHandle tableHandle)
+            throws MetadataException
+    {
+        io.pixelsdb.pixels.common.metadata.domain.Table table = metadataProxy.getMetadataService()
+                .getTable(tableHandle.getSchemaName(), tableHandle.getTableName());
+        SinglePointIndex primaryIndex = metadataProxy.getMetadataService().getPrimaryIndex(table.getId());
+        if (primaryIndex == null || primaryIndex.getKeyColumns() == null ||
+                primaryIndex.getKeyColumns().getKeyColumnIds().isEmpty())
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                    "Pixels UPDATE requires a primary index on " + tableHandle.getSchemaTableName());
+        }
+
+        List<Column> metadataColumns = metadataProxy.getMetadataService().getColumns(
+                tableHandle.getSchemaName(), tableHandle.getTableName(), false);
+        List<PixelsColumnHandle> primaryKeyColumns = new ArrayList<>();
+        for (Integer keyColumnId : primaryIndex.getKeyColumns().getKeyColumnIds())
+        {
+            Column keyColumn = metadataColumns.stream()
+                    .filter(column -> column.getId() == keyColumnId)
+                    .findFirst()
+                    .orElseThrow(() -> new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                            "primary-key column is not present in metadata: " + keyColumnId));
+            PixelsColumnHandle keyHandle = tableHandle.getColumns().stream()
+                    .filter(column -> column.getColumnName().equalsIgnoreCase(keyColumn.getName()))
+                    .findFirst()
+                    .orElseThrow(() -> new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                            "primary-key column is not present in the table handle: " + keyColumn.getName()));
+            primaryKeyColumns.add(keyHandle);
+        }
+        return List.copyOf(primaryKeyColumns);
+    }
+
+    @Override
+    public OptionalLong executeUpdate(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        if (!(tableHandle instanceof PixelsUpdateTableHandle updateHandle)) {
+            throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                    "Pixels UPDATE received an invalid update handle");
+        }
+        PixelsTableHandle pixelsTableHandle = updateHandle.getTableHandle();
+        try {
+            io.pixelsdb.pixels.common.metadata.domain.Table table = metadataProxy.getMetadataService()
+                    .getTable(pixelsTableHandle.getSchemaName(), pixelsTableHandle.getTableName());
+            SinglePointIndex primaryIndex = metadataProxy.getMetadataService().getPrimaryIndex(table.getId());
+            if (primaryIndex == null) {
+                throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                        "Pixels UPDATE requires a primary index on " + pixelsTableHandle.getSchemaTableName());
+            }
+            try (PixelsTagIndex tagIndex = new PixelsTagIndex(table.getId(), primaryIndex.getId(), 0)) {
+                long updated = PixelsUpdateExecutor.execute(updateHandle, primaryIndex, (tag, primaryKeys) -> {
+                    try {
+                        tagIndex.append(tag, primaryKeys);
+                    }
+                    catch (RocksDBException e) {
+                        throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                                "failed to append Pixels UPDATE tag index", e);
+                    }
+                });
+                return OptionalLong.of(updated);
+            }
+        }
+        catch (MetadataException | RocksDBException | SinglePointIndexException | java.io.IOException e) {
+            throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                    "failed to execute Pixels UPDATE for " + pixelsTableHandle.getSchemaTableName(), e);
+        }
     }
 
     private static PixelsTableHandle requirePixelsBaseTable(ConnectorTableHandle tableHandle)
@@ -480,6 +652,10 @@ public class PixelsMetadata implements ConnectorMetadata
     public ColumnMetadata getColumnMetadata(ConnectorSession session, ConnectorTableHandle tableHandle,
                                             ColumnHandle columnHandle)
     {
+        if (columnHandle instanceof PixelsRowIdColumnHandle)
+        {
+            return ((PixelsRowIdColumnHandle) columnHandle).getColumnMetadata();
+        }
         return ((PixelsColumnHandle) columnHandle).getColumnMetadata();
     }
 
@@ -712,6 +888,13 @@ public class PixelsMetadata implements ConnectorMetadata
             Map<String, ColumnHandle> assignments)
     {
         PixelsTableHandle tableHandle = (PixelsTableHandle) handle;
+
+        if (assignments.values().stream().anyMatch(PixelsRowIdColumnHandle.class::isInstance))
+        {
+            // The row id is an analyzer-only handle for index-backed UPDATEs.
+            // It is not a physical Pixels column and must not enter projection pushdown.
+            return Optional.empty();
+        }
 
         List<PixelsColumnHandle> newColumns = assignments.values().stream()
                 .map(PixelsColumnHandle.class::cast).collect(toImmutableList());
