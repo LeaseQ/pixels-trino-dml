@@ -47,6 +47,7 @@ import io.pixelsdb.pixels.trino.impl.PixelsTrinoConfig;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.*;
 import io.trino.spi.expression.ConnectorExpression;
+import io.trino.spi.expression.Constant;
 import io.trino.spi.expression.Variable;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.security.TrinoPrincipal;
@@ -220,6 +221,113 @@ public class PixelsMetadata implements ConnectorMetadata
             throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR, e);
         }
         return null;
+    }
+
+    @Override
+    public ConnectorInsertTableHandle beginInsert(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle,
+            List<ColumnHandle> columns,
+            RetryMode retryMode)
+    {
+        requireNonNull(columns, "columns is null");
+        PixelsTableHandle pixelsTableHandle = requirePixelsBaseTable(tableHandle);
+        List<PixelsColumnHandle> writeColumns = columns.stream()
+                .map(PixelsMetadata::requirePixelsColumn)
+                .collect(toImmutableList());
+        return new PixelsInsertTableHandle(pixelsTableHandle, writeColumns);
+    }
+
+    @Override
+    public Optional<ConnectorOutputMetadata> finishInsert(
+            ConnectorSession session,
+            ConnectorInsertTableHandle insertHandle,
+            List<ConnectorTableHandle> sourceTableHandles,
+            Collection<io.airlift.slice.Slice> fragments,
+            Collection<io.trino.spi.statistics.ComputedStatistics> computedStatistics)
+    {
+        if (!(insertHandle instanceof PixelsInsertTableHandle pixelsInsertTableHandle)) {
+            throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                    "Pixels INSERT received an invalid insert handle");
+        }
+        requireNonNull(fragments, "fragments is null");
+        List<File> files = new ArrayList<>();
+        for (io.airlift.slice.Slice fragment : fragments) {
+            PixelsInsertFragment.Decoded decoded;
+            try {
+                decoded = PixelsInsertFragment.decode(fragment);
+            }
+            catch (RuntimeException e) {
+                throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                        "invalid Pixels INSERT fragment", e);
+            }
+            File file = new File();
+            file.setName(decoded.fileName());
+            file.setType(File.Type.REGULAR);
+            file.setNumRowGroup(decoded.numRowGroups());
+            file.setPathId(decoded.pathId());
+            files.add(file);
+        }
+        if (files.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            metadataProxy.getMetadataService().addFiles(files);
+        }
+        catch (MetadataException e) {
+            throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
+                    "failed to register Pixels INSERT files for " +
+                            pixelsInsertTableHandle.getTableHandle().getSchemaTableName(), e);
+        }
+        return Optional.empty();
+    }
+
+    @Override
+    public Optional<ConnectorTableHandle> applyUpdate(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle,
+            Map<ColumnHandle, Constant> assignments)
+    {
+        requireNonNull(assignments, "assignments is null");
+        if (assignments.isEmpty())
+        {
+            return Optional.empty();
+        }
+
+        PixelsTableHandle pixelsTableHandle = requirePixelsBaseTable(tableHandle);
+        Map<PixelsColumnHandle, Constant> pixelAssignments = new LinkedHashMap<>();
+        for (Map.Entry<ColumnHandle, Constant> assignment : assignments.entrySet())
+        {
+            pixelAssignments.put(
+                    requirePixelsColumn(assignment.getKey()),
+                    requireNonNull(assignment.getValue(), "assignment value is null"));
+        }
+        return Optional.of(new PixelsUpdateTableHandle(pixelsTableHandle, pixelAssignments));
+    }
+
+    private static PixelsTableHandle requirePixelsBaseTable(ConnectorTableHandle tableHandle)
+    {
+        if (!(tableHandle instanceof PixelsTableHandle pixelsTableHandle))
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                    "DML is only supported for a Pixels table");
+        }
+        if (pixelsTableHandle.getTableType() != Table.TableType.BASE)
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                    "DML is only supported for a base Pixels table");
+        }
+        return pixelsTableHandle;
+    }
+
+    private static PixelsColumnHandle requirePixelsColumn(ColumnHandle columnHandle)
+    {
+        if (!(columnHandle instanceof PixelsColumnHandle pixelsColumnHandle))
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                    "DML contains a column handle that does not belong to Pixels");
+        }
+        return pixelsColumnHandle;
     }
 
     @Override

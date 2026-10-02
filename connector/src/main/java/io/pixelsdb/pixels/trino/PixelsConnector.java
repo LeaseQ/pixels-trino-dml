@@ -56,6 +56,7 @@ public class PixelsConnector implements Connector
     private final PixelsMetadataProxy metadataProxy;
     private final PixelsSplitManager splitManager;
     private final PixelsPageSourceProvider pageSourceProvider;
+    private final PixelsPageSinkProvider pageSinkProvider;
     private final PixelsSessionProperties sessionProperties;
     private final PixelsTableProperties tableProperties;
     private final PixelsTrinoConfig config;
@@ -71,6 +72,7 @@ public class PixelsConnector implements Connector
             PixelsSplitManager splitManager,
             PixelsTrinoConfig config,
             PixelsPageSourceProvider pageSourceProvider,
+            PixelsPageSinkProvider pageSinkProvider,
             PixelsSessionProperties sessionProperties,
             PixelsTableProperties tableProperties)
     {
@@ -79,6 +81,7 @@ public class PixelsConnector implements Connector
         this.metadataProxy = requireNonNull(metadataProxy, "metadataProxy is null");
         this.splitManager = requireNonNull(splitManager, "splitManager is null");
         this.pageSourceProvider = requireNonNull(pageSourceProvider, "recordSetProvider is null");
+        this.pageSinkProvider = requireNonNull(pageSinkProvider, "pageSinkProvider is null");
         this.sessionProperties = requireNonNull(sessionProperties, "sessionProperties is null");
         this.tableProperties = requireNonNull(tableProperties, "tableProperties is null");
         this.config = requireNonNull(config, "config is null");
@@ -307,6 +310,12 @@ public class PixelsConnector implements Connector
     public PixelsPageSourceProvider getPageSourceProvider()
     {
         return pageSourceProvider;
+    }
+
+    @Override
+    public PixelsPageSinkProvider getPageSinkProvider()
+    {
+        return pageSinkProvider;
     }
 
     @Override
