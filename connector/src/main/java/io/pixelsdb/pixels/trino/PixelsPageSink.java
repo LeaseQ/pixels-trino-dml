@@ -51,12 +51,24 @@ import static java.util.Objects.requireNonNull;
 final class PixelsPageSink
         implements ConnectorPageSink
 {
+    interface InsertIndexWriter
+    {
+        void appendBatch(VectorizedRowBatch batch, int rowGroupId, int firstRowOffset) throws IOException;
+
+        void finish() throws IOException;
+
+        void abort() throws IOException;
+    }
+
     private final PixelsWriter writer;
     private final VectorizedRowBatch rowBatch;
     private final List<PixelsColumnHandle> columns;
     private final long commitTimestamp;
     private final long targetPathId;
     private final String fileName;
+    private final InsertIndexWriter indexWriter;
+    private final Runnable abortCleanup;
+    private int currentRowGroupOffset;
     private boolean finished;
     private boolean aborted;
 
@@ -77,12 +89,40 @@ final class PixelsPageSink
             long targetPathId,
             String fileName)
     {
+        this(writer, rowBatch, columns, commitTimestamp, targetPathId, fileName, null);
+    }
+
+    PixelsPageSink(
+            PixelsWriter writer,
+            VectorizedRowBatch rowBatch,
+            List<PixelsColumnHandle> columns,
+            long commitTimestamp,
+            long targetPathId,
+            String fileName,
+            InsertIndexWriter indexWriter)
+    {
+        this(writer, rowBatch, columns, commitTimestamp, targetPathId, fileName,
+                indexWriter, () -> {});
+    }
+
+    PixelsPageSink(
+            PixelsWriter writer,
+            VectorizedRowBatch rowBatch,
+            List<PixelsColumnHandle> columns,
+            long commitTimestamp,
+            long targetPathId,
+            String fileName,
+            InsertIndexWriter indexWriter,
+            Runnable abortCleanup)
+    {
         this.writer = requireNonNull(writer, "writer is null");
         this.rowBatch = requireNonNull(rowBatch, "rowBatch is null");
         this.columns = List.copyOf(requireNonNull(columns, "columns is null"));
         this.commitTimestamp = commitTimestamp;
         this.targetPathId = targetPathId;
         this.fileName = fileName;
+        this.indexWriter = indexWriter;
+        this.abortCleanup = requireNonNull(abortCleanup, "abortCleanup is null");
         if (rowBatch.cols.length != columns.size() + 1) {
             throw new IllegalArgumentException("row batch must contain one hidden timestamp column");
         }
@@ -140,6 +180,9 @@ final class PixelsPageSink
         try {
             flush();
             writer.close();
+            if (indexWriter != null) {
+                indexWriter.finish();
+            }
             finished = true;
             if (targetPathId >= 0 && fileName != null) {
                 return CompletableFuture.completedFuture(List.of(
@@ -159,11 +202,25 @@ final class PixelsPageSink
             return;
         }
         try {
-            writer.abort();
-            aborted = true;
+            try {
+                writer.abort();
+            }
+            finally {
+                try {
+                    if (indexWriter != null) {
+                        indexWriter.abort();
+                    }
+                }
+                finally {
+                    abortCleanup.run();
+                }
+            }
         }
         catch (IOException e) {
             throw new TrinoException(PIXELS_WRITER_ERROR, "failed to abort Pixels INSERT writer", e);
+        }
+        finally {
+            aborted = true;
         }
     }
 
@@ -178,7 +235,15 @@ final class PixelsPageSink
         if (rowBatch.isEmpty()) {
             return;
         }
+        int rowGroupId = writer.getNumRowGroup();
+        int batchSize = rowBatch.size;
         writer.addRowBatch(rowBatch);
+        if (indexWriter != null) {
+            indexWriter.appendBatch(rowBatch, rowGroupId, currentRowGroupOffset);
+        }
+        currentRowGroupOffset = writer.getNumRowGroup() > rowGroupId
+                ? 0
+                : currentRowGroupOffset + batchSize;
         rowBatch.reset();
     }
 

@@ -254,7 +254,7 @@ public class PixelsMetadata implements ConnectorMetadata
                     "Pixels INSERT received an invalid insert handle");
         }
         requireNonNull(fragments, "fragments is null");
-        List<File> files = new ArrayList<>();
+        List<PixelsInsertFragment.Decoded> completedFiles = new ArrayList<>();
         for (io.airlift.slice.Slice fragment : fragments) {
             PixelsInsertFragment.Decoded decoded;
             try {
@@ -264,22 +264,39 @@ public class PixelsMetadata implements ConnectorMetadata
                 throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
                         "invalid Pixels INSERT fragment", e);
             }
-            File file = new File();
-            file.setName(decoded.fileName());
-            file.setType(File.Type.REGULAR);
-            file.setNumRowGroup(decoded.numRowGroups());
-            file.setPathId(decoded.pathId());
-            files.add(file);
+            completedFiles.add(decoded);
         }
-        if (files.isEmpty()) {
+        if (completedFiles.isEmpty()) {
             return Optional.empty();
         }
         try {
-            metadataProxy.getMetadataService().addFiles(files);
+            PixelsTableHandle table = pixelsInsertTableHandle.getTableHandle();
+            List<Layout> layouts = metadataProxy.getDataLayouts(table.getSchemaName(), table.getTableName());
+            for (PixelsInsertFragment.Decoded decoded : completedFiles) {
+                Path path = layouts.stream()
+                        .flatMap(layout -> layout.getOrderedPaths().stream())
+                        .filter(candidate -> candidate.getId() == decoded.pathId())
+                        .findFirst()
+                        .orElseThrow(() -> new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
+                                "Pixels INSERT ordered path is absent from metadata: " + decoded.pathId()));
+                String fullPath = path.getUri().endsWith("/")
+                        ? path.getUri() + decoded.fileName()
+                        : path.getUri() + "/" + decoded.fileName();
+                long fileId = metadataProxy.getMetadataService().getFileId(fullPath);
+                File file = metadataProxy.getMetadataService().getFileById(fileId);
+                if (file == null || file.getType() != File.Type.TEMPORARY_INGEST ||
+                        file.getPathId() != decoded.pathId() || !decoded.fileName().equals(file.getName())) {
+                    throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
+                            "Pixels INSERT temporary file does not match its worker fragment: " + fullPath);
+                }
+                file.setType(File.Type.REGULAR);
+                file.setNumRowGroup(decoded.numRowGroups());
+                metadataProxy.getMetadataService().updateFile(file);
+            }
         }
         catch (MetadataException e) {
             throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
-                    "failed to register Pixels INSERT files for " +
+                    "failed to publish Pixels INSERT files for " +
                             pixelsInsertTableHandle.getTableHandle().getSchemaTableName(), e);
         }
         return Optional.empty();
@@ -372,6 +389,11 @@ public class PixelsMetadata implements ConnectorMetadata
             ConnectorTableHandle tableHandle,
             List<PixelsColumnHandle> updatedColumns)
     {
+        if (updatedColumns.isEmpty())
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
+                    "Pixels merge currently supports UPDATE only; DELETE is not supported");
+        }
         PixelsTableHandle pixelsTableHandle = requirePixelsBaseTable(tableHandle);
         try
         {

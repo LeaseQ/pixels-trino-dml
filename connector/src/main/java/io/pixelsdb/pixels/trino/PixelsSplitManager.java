@@ -25,13 +25,18 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.inject.Inject;
 import com.google.protobuf.InvalidProtocolBufferException;
+import com.google.protobuf.ByteString;
 import io.airlift.log.Logger;
 import io.airlift.slice.Slice;
 import io.etcd.jetcd.KeyValue;
 import io.pixelsdb.pixels.cache.PixelsCacheUtil;
 import io.pixelsdb.pixels.common.exception.MetadataException;
+import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.exception.RetinaException;
 import io.pixelsdb.pixels.common.layout.*;
+import io.pixelsdb.pixels.common.index.IndexOption;
+import io.pixelsdb.pixels.common.index.service.IndexService;
+import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
 import io.pixelsdb.pixels.common.metadata.SchemaTableName;
 import io.pixelsdb.pixels.common.metadata.domain.Table;
 import io.pixelsdb.pixels.common.metadata.domain.*;
@@ -45,6 +50,7 @@ import io.pixelsdb.pixels.common.turbo.Output;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
 import io.pixelsdb.pixels.common.utils.Constants;
 import io.pixelsdb.pixels.common.utils.EtcdUtil;
+import io.pixelsdb.pixels.common.utils.IndexUtils;
 import io.pixelsdb.pixels.core.TypeDescription;
 import io.pixelsdb.pixels.core.utils.Pair;
 import io.pixelsdb.pixels.daemon.NodeProto;
@@ -75,6 +81,8 @@ import io.pixelsdb.pixels.trino.properties.PixelsSessionProperties;
 import io.pixelsdb.pixels.trino.split.PixelsBufferSplit;
 import io.pixelsdb.pixels.trino.split.PixelsFileSplit;
 import io.pixelsdb.pixels.trino.split.PixelsSplit;
+import io.pixelsdb.pixels.index.IndexProto;
+import io.pixelsdb.pixels.index.rocksdb.PixelsTagIndex;
 import io.trino.spi.HostAddress;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.*;
@@ -82,6 +90,7 @@ import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.StandardTypes;
 import io.trino.spi.type.Type;
+import org.rocksdb.RocksDBException;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -392,6 +401,7 @@ public class PixelsSplitManager implements ConnectorSplitManager
             {
                 List<PixelsColumnHandle> withFilterColumns = getIncludeColumns(tableHandle);
                 if (transHandle.getExecutorType() == ExecutorType.CF
+                        && !isTagPointLookupCandidate(tableHandle)
                         /**
                          * Issue #57:
                          * If the number of columns to read is 0, the spits should not be processed by serverless workers.
@@ -1015,6 +1025,11 @@ public class PixelsSplitManager implements ConnectorSplitManager
             table = metadataProxy.getTable(transHandle.getTransId(), schemaName, tableName);
             storage = StorageFactory.Instance().getStorage(table.getStorageScheme());
             layouts = metadataProxy.getDataLayouts(schemaName, tableName);
+            List<PixelsFileSplit> tagPointSplits = getTagPointSplits(
+                    transHandle, tableHandle, table, storage, layouts, constraint, desiredColumns);
+            if (tagPointSplits != null) {
+                return tagPointSplits;
+            }
             // PIXELS-506: add the column size of the base table to the scan size of this query.
             List<Column> columns = metadataProxy.getColumnStatistics(transHandle.getTransId(), schemaName, tableName);
             Map<String, Column> nameToColumnMap = new HashMap<>(columns.size());
@@ -1363,6 +1378,163 @@ public class PixelsSplitManager implements ConnectorSplitManager
         }
 
         return pixelsSplits;
+    }
+
+    private boolean isTagPointLookupCandidate(PixelsTableHandle tableHandle)
+    {
+        String tagColumnName = config.getConfigFactory().getProperty("dml.tag.column");
+        if (tagColumnName == null || tagColumnName.isBlank()) {
+            return false;
+        }
+        PixelsColumnHandle tagColumn = getIncludeColumns(tableHandle).stream()
+                .filter(column -> column.getColumnName().equalsIgnoreCase(tagColumnName))
+                .findFirst()
+                .orElse(null);
+        return tagColumn != null && PixelsTagPointLookup.extractTagValue(
+                tableHandle.getConstraint(), tagColumn).isPresent();
+    }
+
+    /**
+     * Resolve an exact tag predicate through the tag index and primary index.
+     * The returned splits still carry the original predicate, so the reader
+     * performs the final row-level correctness check after the row-group prune.
+     * A null result means that this query is not an eligible tag point lookup.
+     */
+    private List<PixelsFileSplit> getTagPointSplits(
+            PixelsTransactionHandle transHandle,
+            PixelsTableHandle tableHandle,
+            Table table,
+            Storage storage,
+            List<Layout> layouts,
+            TupleDomain<PixelsColumnHandle> constraint,
+            List<PixelsColumnHandle> desiredColumns)
+    {
+        String tagColumnName = config.getConfigFactory().getProperty("dml.tag.column");
+        if (tagColumnName == null || tagColumnName.isBlank()) {
+            return null;
+        }
+        PixelsColumnHandle tagColumn = desiredColumns.stream()
+                .filter(column -> column.getColumnName().equalsIgnoreCase(tagColumnName))
+                .findFirst()
+                .orElse(null);
+        if (tagColumn == null) {
+            return null;
+        }
+        byte[] tag;
+        try {
+            Optional<byte[]> encodedTag = PixelsTagPointLookup.extractTagValue(constraint, tagColumn);
+            if (encodedTag.isEmpty()) {
+                return null;
+            }
+            tag = encodedTag.get();
+        }
+        catch (RuntimeException e) {
+            throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                    "failed to encode the Pixels tag lookup value", e);
+        }
+
+        try {
+            io.pixelsdb.pixels.common.metadata.domain.SinglePointIndex primaryIndex =
+                    metadataProxy.getMetadataService().getPrimaryIndex(table.getId());
+            if (primaryIndex == null) {
+                throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                        "Pixels tag lookup requires a primary index");
+            }
+
+            List<byte[]> primaryKeys;
+            try (PixelsTagIndex tagIndex = new PixelsTagIndex(table.getId(), primaryIndex.getId(), 0)) {
+                primaryKeys = tagIndex.get(tag);
+            }
+            if (primaryKeys.isEmpty()) {
+                return List.of();
+            }
+
+            String configuredMode = config.getConfigFactory().getProperty("dml.insert.index.service");
+            IndexServiceProvider.ServiceMode serviceMode = configuredMode == null || configuredMode.isBlank()
+                    ? IndexServiceProvider.ServiceMode.rpc
+                    : IndexServiceProvider.ServiceMode.from(configuredMode);
+            IndexService indexService = IndexServiceProvider.getService(serviceMode);
+            List<IndexProto.RowLocation> locations = new ArrayList<>(primaryKeys.size());
+            for (byte[] primaryKey : primaryKeys) {
+                ByteString key = ByteString.copyFrom(primaryKey);
+                IndexProto.IndexKey indexKey = IndexProto.IndexKey.newBuilder()
+                        .setTableId(table.getId())
+                        .setIndexId(primaryIndex.getId())
+                        .setKey(key)
+                        .setTimestamp(Long.MAX_VALUE)
+                        .build();
+                IndexProto.RowLocation location = indexService.lookupUniqueIndex(indexKey,
+                        IndexOption.builder()
+                                .vNodeId(IndexUtils.getBucketIdFromByteBuffer(key))
+                                .build());
+                if (location != null) {
+                    locations.add(location);
+                }
+            }
+            if (locations.isEmpty()) {
+                return List.of();
+            }
+
+            Map<Long, Map<Integer, List<Integer>>> grouped = PixelsTagPointLookup.groupLocations(locations);
+            Map<Long, Path> pathsById = new HashMap<>();
+            Map<Long, List<String>> columnOrderByPathId = new HashMap<>();
+            for (Layout layout : layouts) {
+                List<String> columnOrder = layout.getOrdered().getColumnOrder();
+                for (Path path : layout.getOrderedPaths()) {
+                    pathsById.put(path.getId(), path);
+                    columnOrderByPathId.put(path.getId(), columnOrder);
+                }
+                for (Path path : layout.getCompactPaths()) {
+                    pathsById.put(path.getId(), path);
+                    columnOrderByPathId.put(path.getId(), columnOrder);
+                }
+                for (Path path : layout.getProjectionPaths().values()) {
+                    pathsById.put(path.getId(), path);
+                    columnOrderByPathId.put(path.getId(), columnOrder);
+                }
+            }
+
+            List<PixelsFileSplit> splits = new ArrayList<>();
+            long splitId = 0;
+            for (Map.Entry<Long, Map<Integer, List<Integer>>> fileEntry : grouped.entrySet()) {
+                io.pixelsdb.pixels.common.metadata.domain.File file =
+                        metadataProxy.getMetadataService().getFileById(fileEntry.getKey());
+                if (file == null || file.getType() != io.pixelsdb.pixels.common.metadata.domain.File.Type.REGULAR) {
+                    continue;
+                }
+                Path path = pathsById.get(file.getPathId());
+                if (path == null) {
+                    throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
+                            "Pixels tag lookup file path is absent: " + file.getPathId());
+                }
+                String filePath = path.getUri().endsWith("/")
+                        ? path.getUri() + file.getName()
+                        : path.getUri() + "/" + file.getName();
+                List<String> columnOrder = columnOrderByPathId.getOrDefault(
+                        path.getId(), List.of());
+                for (Integer rowGroup : fileEntry.getValue().keySet()) {
+                    splits.add(new PixelsFileSplit(
+                            transHandle.getTransId(), splitId++, connectorId,
+                            tableHandle.getSchemaName(), tableHandle.getTableName(),
+                            table.getStorageScheme().name(), List.of(filePath), List.of(rowGroup), List.of(1),
+                            false, storage.hasLocality(), toHostAddresses(storage.getLocations(filePath)),
+                            columnOrder, List.of(), constraint, false, false));
+                }
+            }
+            return splits;
+        }
+        catch (MetadataException e) {
+            throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
+                    "failed to resolve Pixels tag lookup files", e);
+        }
+        catch (IndexException | RocksDBException e) {
+            throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                    "failed to resolve Pixels tag lookup index", e);
+        }
+        catch (IOException e) {
+            throw new TrinoException(PixelsErrorCode.PIXELS_STORAGE_ERROR,
+                    "failed to resolve Pixels tag lookup storage location", e);
+        }
     }
 
     private boolean isRetinaBufferSplitEnabled()

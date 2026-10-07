@@ -89,6 +89,25 @@ class PixelsPageSinkTest
         assertEquals("writer_file.pxl", decoded.fileName());
     }
 
+    @Test
+    void recordsPrimaryKeysAtTheirWrittenRowGroupOffsets()
+    {
+        RecordingWriter writer = new RecordingWriter();
+        RecordingInsertIndex index = new RecordingInsertIndex();
+        TypeDescription schema = TypeDescription.createSchemaFromStrings(
+                List.of("id"), List.of("long"));
+        PixelsPageSink sink = new PixelsPageSink(
+                writer, schema.createRowBatchWithHiddenColumn(2), List.of(column("id")),
+                1234L, 42L, "writer_file.pxl", index);
+
+        sink.appendPage(new Page(new LongArrayBlock(
+                3, Optional.empty(), new long[] {11L, 22L, 33L})));
+        sink.finish().join();
+
+        assertEquals(List.of("0:0:11", "0:1:22", "1:0:33"), index.locations);
+        assertEquals(1, index.finishCount);
+    }
+
     private static PixelsColumnHandle column(String name)
     {
         return new PixelsColumnHandle(
@@ -163,6 +182,33 @@ class PixelsPageSinkTest
         {
             aborted = true;
             abortCount++;
+        }
+    }
+
+    private static final class RecordingInsertIndex implements PixelsPageSink.InsertIndexWriter
+    {
+        private final List<String> locations = new ArrayList<>();
+        private int finishCount;
+
+        @Override
+        public void appendBatch(VectorizedRowBatch batch, int rowGroupId, int firstRowOffset)
+        {
+            LongColumnVector ids = (LongColumnVector) batch.cols[0];
+            for (int position = 0; position < batch.size; position++)
+            {
+                locations.add(rowGroupId + ":" + (firstRowOffset + position) + ":" + ids.vector[position]);
+            }
+        }
+
+        @Override
+        public void finish()
+        {
+            finishCount++;
+        }
+
+        @Override
+        public void abort()
+        {
         }
     }
 }

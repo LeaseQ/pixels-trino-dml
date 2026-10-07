@@ -30,13 +30,18 @@ import static java.util.Objects.requireNonNull;
 final class PixelsMergeSink implements ConnectorMergeSink
 {
     private final PixelsMergeTableHandle handle;
-    private final PixelsTagIndex tagIndex;
+    private final TagIndex tagIndex;
     private boolean closed;
 
     PixelsMergeSink(PixelsMergeTableHandle handle) throws RocksDBException, SinglePointIndexException, IOException
     {
+        this(handle, new RocksTagIndex(handle));
+    }
+
+    PixelsMergeSink(PixelsMergeTableHandle handle, TagIndex tagIndex)
+    {
         this.handle = requireNonNull(handle, "handle is null");
-        this.tagIndex = new PixelsTagIndex(handle.getTableId(), handle.getIndexId(), 0);
+        this.tagIndex = requireNonNull(tagIndex, "tagIndex is null");
     }
 
     @Override
@@ -61,10 +66,15 @@ final class PixelsMergeSink implements ConnectorMergeSink
         Block rowIdBlock = page.getBlock(rowIdChannel);
         for (int position = 0; position < page.getPositionCount(); position++)
         {
-            if (operationBlock.isNull(position) ||
-                    TinyintType.TINYINT.getLong(operationBlock, position) != UPDATE_OPERATION_NUMBER)
+            if (operationBlock.isNull(position))
             {
-                continue;
+                throw new TrinoException(PIXELS_INVERTED_INDEX_ERROR,
+                        "Pixels merge operation must not be null");
+            }
+            if (TinyintType.TINYINT.getLong(operationBlock, position) != UPDATE_OPERATION_NUMBER)
+            {
+                throw new TrinoException(PIXELS_INVERTED_INDEX_ERROR,
+                        "Pixels merge sink supports UPDATE only; DELETE and INSERT are not supported");
             }
             byte[] primaryKey = encodeValue(primaryKeyColumn, rowIdBlock, position);
             for (PixelsColumnHandle updatedColumn : handle.getUpdatedColumns())
@@ -145,5 +155,35 @@ final class PixelsMergeSink implements ConnectorMergeSink
             value = String.valueOf(type.getLong(block, position));
         }
         return TypeDescription.fromString(type.getDisplayName()).convertSqlStringToByte(value);
+    }
+
+    interface TagIndex
+    {
+        void append(byte[] tag, List<byte[]> primaryKeys) throws RocksDBException;
+
+        void close() throws IOException;
+    }
+
+    private static final class RocksTagIndex implements TagIndex
+    {
+        private final PixelsTagIndex delegate;
+
+        private RocksTagIndex(PixelsMergeTableHandle handle)
+                throws RocksDBException, SinglePointIndexException, IOException
+        {
+            this.delegate = new PixelsTagIndex(handle.getTableId(), handle.getIndexId(), 0);
+        }
+
+        @Override
+        public void append(byte[] tag, List<byte[]> primaryKeys) throws RocksDBException
+        {
+            delegate.append(tag, primaryKeys);
+        }
+
+        @Override
+        public void close() throws IOException
+        {
+            delegate.close();
+        }
     }
 }

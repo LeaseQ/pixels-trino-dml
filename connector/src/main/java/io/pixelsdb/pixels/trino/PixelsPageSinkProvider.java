@@ -7,6 +7,10 @@ package io.pixelsdb.pixels.trino;
 
 import com.google.inject.Inject;
 import io.pixelsdb.pixels.common.exception.MetadataException;
+import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
+import io.pixelsdb.pixels.common.metadata.MetadataService;
+import io.pixelsdb.pixels.common.metadata.domain.Column;
+import io.pixelsdb.pixels.common.metadata.domain.File;
 import io.pixelsdb.pixels.common.metadata.domain.Layout;
 import io.pixelsdb.pixels.common.metadata.domain.Path;
 import io.pixelsdb.pixels.common.physical.Storage;
@@ -121,9 +125,26 @@ public final class PixelsPageSinkProvider
         String filePath = targetPath.uri().endsWith("/")
                 ? targetPath.uri() + fileName
                 : targetPath.uri() + "/" + fileName;
+        MetadataService metadataService = metadataProxy.getMetadataService();
+        long fileId = -1;
+        PixelsWriter writer = null;
         try {
+            io.pixelsdb.pixels.common.metadata.domain.Table metadataTable = metadataService.getTable(
+                    table.getSchemaName(), table.getTableName());
+            io.pixelsdb.pixels.common.metadata.domain.SinglePointIndex primaryIndex =
+                    metadataService.getPrimaryIndex(metadataTable.getId());
+            List<Integer> keyOrdinals = primaryIndex == null ? List.of() :
+                    resolvePrimaryKeyOrdinals(metadataService, table, columns, primaryIndex);
+            File metadataFile = new File();
+            metadataFile.setName(fileName);
+            metadataFile.setType(File.Type.TEMPORARY_INGEST);
+            metadataFile.setNumRowGroup(1);
+            metadataFile.setPathId(targetPath.pathId());
+            metadataService.addFiles(List.of(metadataFile));
+            fileId = metadataService.getFileId(filePath);
+            long registeredFileId = fileId;
             Storage storage = StorageFactory.Instance().getStorage(targetPath.uri());
-            PixelsWriter writer = PixelsWriterImpl.newBuilder()
+            writer = PixelsWriterImpl.newBuilder()
                     .setSchema(schema)
                     .setHasHiddenColumn(true)
                     .setPixelStride(Integer.parseInt(pixelsConfig.getProperty("pixel.stride")))
@@ -137,18 +158,87 @@ public final class PixelsPageSinkProvider
                     .setNullsPadding(false)
                     .setCompressionBlockSize(Integer.parseInt(pixelsConfig.getProperty("compression.block.size")))
                     .build();
+            PixelsPageSink.InsertIndexWriter indexWriter = null;
+            if (primaryIndex != null) {
+                String configuredMode = pixelsConfig.getProperty("dml.insert.index.service");
+                IndexServiceProvider.ServiceMode serviceMode = configuredMode == null || configuredMode.isBlank()
+                        ? IndexServiceProvider.ServiceMode.rpc
+                        : IndexServiceProvider.ServiceMode.from(configuredMode);
+                indexWriter = new PixelsInsertIndexWriter(
+                        IndexServiceProvider.getService(serviceMode), metadataTable.getId(),
+                        primaryIndex.getId(), fileId, pixelsTransactionHandle.getTimestamp(),
+                        columns, keyOrdinals);
+            }
             return new PixelsPageSink(
                     writer,
                     schema.createRowBatchWithHiddenColumn(PixelsTrinoConfig.getBatchSize()),
                     columns,
                     pixelsTransactionHandle.getTimestamp(),
                     targetPath.pathId(),
-                    fileName);
+                    fileName,
+                    indexWriter,
+                    () -> {
+                        try {
+                            metadataService.deleteFiles(List.of(registeredFileId));
+                        }
+                        catch (MetadataException e) {
+                            throw new TrinoException(PIXELS_METADATA_ERROR,
+                                    "failed to remove aborted Pixels INSERT file", e);
+                        }
+                    });
         }
-        catch (IOException | RuntimeException e) {
+        catch (IOException | MetadataException | RuntimeException e) {
+            if (writer != null) {
+                try {
+                    writer.abort();
+                }
+                catch (IOException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
+            }
+            if (fileId > 0) {
+                try {
+                    metadataService.deleteFiles(List.of(fileId));
+                }
+                catch (MetadataException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
+            }
             throw new TrinoException(PixelsErrorCode.PIXELS_WRITER_OPEN_ERROR,
                     "failed to create Pixels INSERT writer for " + filePath, e);
         }
+    }
+
+    private static List<Integer> resolvePrimaryKeyOrdinals(
+            MetadataService metadataService,
+            PixelsTableHandle table,
+            List<PixelsColumnHandle> insertColumns,
+            io.pixelsdb.pixels.common.metadata.domain.SinglePointIndex primaryIndex)
+            throws MetadataException
+    {
+        List<Column> tableColumns = metadataService.getColumns(
+                table.getSchemaName(), table.getTableName(), false);
+        List<Integer> ordinals = new ArrayList<>();
+        for (Integer columnId : primaryIndex.getKeyColumns().getKeyColumnIds()) {
+            Column keyColumn = tableColumns.stream()
+                    .filter(column -> column.getId() == columnId)
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "Pixels INSERT primary-key column is absent from metadata: " + columnId));
+            int ordinal = -1;
+            for (int i = 0; i < insertColumns.size(); i++) {
+                if (insertColumns.get(i).getColumnName().equalsIgnoreCase(keyColumn.getName())) {
+                    ordinal = i;
+                    break;
+                }
+            }
+            if (ordinal < 0) {
+                throw new IllegalArgumentException(
+                        "Pixels INSERT must provide primary-key column " + keyColumn.getName());
+            }
+            ordinals.add(ordinal);
+        }
+        return ordinals;
     }
 
     private TargetPath selectTargetPath(PixelsTableHandle table, long pageSinkId)
