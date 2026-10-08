@@ -10,6 +10,7 @@ import io.pixelsdb.pixels.core.TypeDescription;
 import io.pixelsdb.pixels.core.vector.LongColumnVector;
 import io.pixelsdb.pixels.core.vector.VectorizedRowBatch;
 import io.trino.spi.Page;
+import io.trino.spi.TrinoException;
 import io.trino.spi.block.LongArrayBlock;
 import io.trino.spi.type.BigintType;
 import org.junit.jupiter.api.Test;
@@ -22,6 +23,7 @@ import java.util.Optional;
 import static io.pixelsdb.pixels.core.TypeDescription.Category.LONG;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class PixelsPageSinkTest
 {
@@ -108,6 +110,50 @@ class PixelsPageSinkTest
         assertEquals(1, index.finishCount);
     }
 
+    @Test
+    void finishFailureAbortsWriterIndexAndMetadataCleanup()
+    {
+        RecordingWriter writer = new RecordingWriter(true);
+        RecordingInsertIndex index = new RecordingInsertIndex();
+        List<Boolean> cleanupCalls = new ArrayList<>();
+        TypeDescription schema = TypeDescription.createSchemaFromStrings(
+                List.of("id"), List.of("long"));
+        PixelsPageSink sink = new PixelsPageSink(
+                writer, schema.createRowBatchWithHiddenColumn(2), List.of(column("id")),
+                1234L, 42L, "writer_file.pxl", index, () -> cleanupCalls.add(true));
+
+        sink.appendPage(new Page(new LongArrayBlock(
+                1, Optional.empty(), new long[] {11L})));
+
+        assertThrows(TrinoException.class, sink::finish);
+
+        assertEquals(1, writer.abortCount);
+        assertEquals(1, index.abortCount);
+        assertEquals(List.of(true), cleanupCalls);
+    }
+
+    @Test
+    void runtimeFinishFailureAlsoAbortsWriterIndexAndMetadataCleanup()
+    {
+        RecordingWriter writer = new RecordingWriter();
+        RecordingInsertIndex index = new RecordingInsertIndex(true);
+        List<Boolean> cleanupCalls = new ArrayList<>();
+        TypeDescription schema = TypeDescription.createSchemaFromStrings(
+                List.of("id"), List.of("long"));
+        PixelsPageSink sink = new PixelsPageSink(
+                writer, schema.createRowBatchWithHiddenColumn(2), List.of(column("id")),
+                1234L, 42L, "writer_file.pxl", index, () -> cleanupCalls.add(true));
+
+        sink.appendPage(new Page(new LongArrayBlock(
+                1, Optional.empty(), new long[] {11L})));
+
+        assertThrows(RuntimeException.class, sink::finish);
+
+        assertEquals(1, writer.abortCount);
+        assertEquals(1, index.abortCount);
+        assertEquals(List.of(true), cleanupCalls);
+    }
+
     private static PixelsColumnHandle column(String name)
     {
         return new PixelsColumnHandle(
@@ -122,6 +168,17 @@ class PixelsPageSinkTest
         private int closeCount;
         private int abortCount;
         private boolean aborted;
+        private final boolean failOnClose;
+
+        private RecordingWriter()
+        {
+            this(false);
+        }
+
+        private RecordingWriter(boolean failOnClose)
+        {
+            this.failOnClose = failOnClose;
+        }
 
         @Override
         public boolean addRowBatch(VectorizedRowBatch rowBatch)
@@ -175,6 +232,10 @@ class PixelsPageSinkTest
         public void close() throws IOException
         {
             closeCount++;
+            if (failOnClose)
+            {
+                throw new IOException("writer close failed");
+            }
         }
 
         @Override
@@ -189,6 +250,18 @@ class PixelsPageSinkTest
     {
         private final List<String> locations = new ArrayList<>();
         private int finishCount;
+        private int abortCount;
+        private final boolean failOnFinish;
+
+        private RecordingInsertIndex()
+        {
+            this(false);
+        }
+
+        private RecordingInsertIndex(boolean failOnFinish)
+        {
+            this.failOnFinish = failOnFinish;
+        }
 
         @Override
         public void appendBatch(VectorizedRowBatch batch, int rowGroupId, int firstRowOffset)
@@ -204,11 +277,16 @@ class PixelsPageSinkTest
         public void finish()
         {
             finishCount++;
+            if (failOnFinish)
+            {
+                throw new IllegalStateException("index finish failed");
+            }
         }
 
         @Override
         public void abort()
         {
+            abortCount++;
         }
     }
 }

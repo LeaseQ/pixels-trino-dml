@@ -6,16 +6,18 @@
 package io.pixelsdb.pixels.trino;
 
 import io.airlift.slice.Slice;
-import io.pixelsdb.pixels.common.exception.SinglePointIndexException;
+import com.google.protobuf.ByteString;
+import io.pixelsdb.pixels.common.exception.IndexException;
+import io.pixelsdb.pixels.common.index.service.IndexService;
+import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
 import io.pixelsdb.pixels.core.TypeDescription;
-import io.pixelsdb.pixels.index.rocksdb.PixelsTagIndex;
+import io.pixelsdb.pixels.index.IndexProto;
 import io.trino.spi.Page;
 import io.trino.spi.TrinoException;
 import io.trino.spi.block.Block;
 import io.trino.spi.connector.ConnectorMergeSink;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TinyintType;
-import org.rocksdb.RocksDBException;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -33,9 +35,9 @@ final class PixelsMergeSink implements ConnectorMergeSink
     private final TagIndex tagIndex;
     private boolean closed;
 
-    PixelsMergeSink(PixelsMergeTableHandle handle) throws RocksDBException, SinglePointIndexException, IOException
+    PixelsMergeSink(PixelsMergeTableHandle handle)
     {
-        this(handle, new RocksTagIndex(handle));
+        this(handle, new RpcTagIndex(handle));
     }
 
     PixelsMergeSink(PixelsMergeTableHandle handle, TagIndex tagIndex)
@@ -85,16 +87,8 @@ final class PixelsMergeSink implements ConnectorMergeSink
                     throw new TrinoException(PIXELS_INVERTED_INDEX_ERROR,
                             "updated column is not present in the merge page: " + updatedColumn.getColumnName());
                 }
-                try
-                {
-                    tagIndex.append(encodeValue(updatedColumn, page.getBlock(dataIndex), position),
-                            List.of(primaryKey));
-                }
-                catch (RocksDBException e)
-                {
-                    throw new TrinoException(PIXELS_INVERTED_INDEX_ERROR,
-                            "failed to append Pixels UPDATE tag index", e);
-                }
+                tagIndex.append(encodeValue(updatedColumn, page.getBlock(dataIndex), position),
+                        List.of(primaryKey));
             }
         }
     }
@@ -116,15 +110,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
     {
         if (!closed)
         {
-            try
-            {
-                tagIndex.close();
-            }
-            catch (IOException e)
-            {
-                throw new TrinoException(PIXELS_INVERTED_INDEX_ERROR,
-                        "failed to close Pixels UPDATE tag index", e);
-            }
+            tagIndex.close();
             closed = true;
         }
     }
@@ -159,31 +145,46 @@ final class PixelsMergeSink implements ConnectorMergeSink
 
     interface TagIndex
     {
-        void append(byte[] tag, List<byte[]> primaryKeys) throws RocksDBException;
+        void append(byte[] tag, List<byte[]> primaryKeys);
 
-        void close() throws IOException;
+        void close();
     }
 
-    private static final class RocksTagIndex implements TagIndex
+    private static final class RpcTagIndex implements TagIndex
     {
-        private final PixelsTagIndex delegate;
+        private final PixelsMergeTableHandle handle;
+        private final IndexService indexService;
 
-        private RocksTagIndex(PixelsMergeTableHandle handle)
-                throws RocksDBException, SinglePointIndexException, IOException
+        private RpcTagIndex(PixelsMergeTableHandle handle)
         {
-            this.delegate = new PixelsTagIndex(handle.getTableId(), handle.getIndexId(), 0);
+            this.handle = requireNonNull(handle, "handle is null");
+            this.indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.rpc);
         }
 
         @Override
-        public void append(byte[] tag, List<byte[]> primaryKeys) throws RocksDBException
+        public void append(byte[] tag, List<byte[]> primaryKeys)
         {
-            delegate.append(tag, primaryKeys);
+            try
+            {
+                List<ByteString> encodedPrimaryKeys = primaryKeys.stream()
+                        .map(ByteString::copyFrom)
+                        .toList();
+                indexService.appendTagIndexEntries(handle.getTableId(), handle.getIndexId(), List.of(
+                        IndexProto.TagIndexUpdate.newBuilder()
+                                .setTag(ByteString.copyFrom(tag))
+                                .addAllPrimaryKeys(encodedPrimaryKeys)
+                                .build()));
+            }
+            catch (IndexException e)
+            {
+                throw new TrinoException(PIXELS_INVERTED_INDEX_ERROR,
+                        "failed to append Pixels UPDATE tag index through IndexServer", e);
+            }
         }
 
         @Override
-        public void close() throws IOException
+        public void close()
         {
-            delegate.close();
         }
     }
 }

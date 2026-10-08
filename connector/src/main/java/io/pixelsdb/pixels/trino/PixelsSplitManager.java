@@ -82,7 +82,6 @@ import io.pixelsdb.pixels.trino.split.PixelsBufferSplit;
 import io.pixelsdb.pixels.trino.split.PixelsFileSplit;
 import io.pixelsdb.pixels.trino.split.PixelsSplit;
 import io.pixelsdb.pixels.index.IndexProto;
-import io.pixelsdb.pixels.index.rocksdb.PixelsTagIndex;
 import io.trino.spi.HostAddress;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.*;
@@ -90,7 +89,6 @@ import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.StandardTypes;
 import io.trino.spi.type.Type;
-import org.rocksdb.RocksDBException;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -1441,19 +1439,14 @@ public class PixelsSplitManager implements ConnectorSplitManager
                         "Pixels tag lookup requires a primary index");
             }
 
-            List<byte[]> primaryKeys;
-            try (PixelsTagIndex tagIndex = new PixelsTagIndex(table.getId(), primaryIndex.getId(), 0)) {
-                primaryKeys = tagIndex.get(tag);
-            }
+            IndexService indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.rpc);
+            List<byte[]> primaryKeys = indexService.getTagIndexEntries(
+                            table.getId(), primaryIndex.getId(), ByteString.copyFrom(tag)).stream()
+                    .map(ByteString::toByteArray)
+                    .toList();
             if (primaryKeys.isEmpty()) {
                 return List.of();
             }
-
-            String configuredMode = config.getConfigFactory().getProperty("dml.insert.index.service");
-            IndexServiceProvider.ServiceMode serviceMode = configuredMode == null || configuredMode.isBlank()
-                    ? IndexServiceProvider.ServiceMode.rpc
-                    : IndexServiceProvider.ServiceMode.from(configuredMode);
-            IndexService indexService = IndexServiceProvider.getService(serviceMode);
             List<IndexProto.RowLocation> locations = new ArrayList<>(primaryKeys.size());
             for (byte[] primaryKey : primaryKeys) {
                 ByteString key = ByteString.copyFrom(primaryKey);
@@ -1527,7 +1520,7 @@ public class PixelsSplitManager implements ConnectorSplitManager
             throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
                     "failed to resolve Pixels tag lookup files", e);
         }
-        catch (IndexException | RocksDBException e) {
+        catch (IndexException e) {
             throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
                     "failed to resolve Pixels tag lookup index", e);
         }

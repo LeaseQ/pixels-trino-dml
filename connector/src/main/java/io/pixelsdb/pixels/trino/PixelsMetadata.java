@@ -24,13 +24,16 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 import io.airlift.json.JsonCodec;
 import io.airlift.json.JsonCodecFactory;
 import io.airlift.json.ObjectMapperProvider;
 import io.airlift.log.Logger;
 import io.pixelsdb.pixels.common.exception.MetadataException;
-import io.pixelsdb.pixels.common.exception.SinglePointIndexException;
+import io.pixelsdb.pixels.common.exception.IndexException;
+import io.pixelsdb.pixels.common.index.service.IndexService;
+import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.metadata.domain.*;
 import io.pixelsdb.pixels.common.physical.Storage;
@@ -41,7 +44,6 @@ import io.pixelsdb.pixels.core.stats.RangeStats;
 import io.pixelsdb.pixels.core.stats.StatsRecorder;
 import io.pixelsdb.pixels.daemon.MetadataProto;
 import io.pixelsdb.pixels.executor.aggregation.FunctionType;
-import io.pixelsdb.pixels.index.rocksdb.PixelsTagIndex;
 import io.pixelsdb.pixels.planner.plan.logical.Table;
 import io.pixelsdb.pixels.trino.exception.PixelsErrorCode;
 import io.pixelsdb.pixels.trino.impl.PixelsMetadataProxy;
@@ -60,7 +62,6 @@ import io.trino.spi.statistics.TableStatistics;
 
 import java.nio.ByteBuffer;
 import java.util.*;
-import org.rocksdb.RocksDBException;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Verify.verify;
@@ -480,20 +481,26 @@ public class PixelsMetadata implements ConnectorMetadata
                 throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
                         "Pixels UPDATE requires a primary index on " + pixelsTableHandle.getSchemaTableName());
             }
-            try (PixelsTagIndex tagIndex = new PixelsTagIndex(table.getId(), primaryIndex.getId(), 0)) {
-                long updated = PixelsUpdateExecutor.execute(updateHandle, primaryIndex, (tag, primaryKeys) -> {
-                    try {
-                        tagIndex.append(tag, primaryKeys);
-                    }
-                    catch (RocksDBException e) {
-                        throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
-                                "failed to append Pixels UPDATE tag index", e);
-                    }
-                });
-                return OptionalLong.of(updated);
-            }
+            IndexService indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.rpc);
+            long updated = PixelsUpdateExecutor.execute(updateHandle, primaryIndex, (tag, primaryKeys) -> {
+                try {
+                    List<ByteString> encodedPrimaryKeys = primaryKeys.stream()
+                            .map(ByteString::copyFrom)
+                            .toList();
+                    indexService.appendTagIndexEntries(table.getId(), primaryIndex.getId(), List.of(
+                            io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
+                                    .setTag(ByteString.copyFrom(tag))
+                                    .addAllPrimaryKeys(encodedPrimaryKeys)
+                                    .build()));
+                }
+                catch (IndexException e) {
+                    throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                            "failed to append Pixels UPDATE tag index through IndexServer", e);
+                }
+            });
+            return OptionalLong.of(updated);
         }
-        catch (MetadataException | RocksDBException | SinglePointIndexException | java.io.IOException e) {
+        catch (MetadataException e) {
             throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
                     "failed to execute Pixels UPDATE for " + pixelsTableHandle.getSchemaTableName(), e);
         }

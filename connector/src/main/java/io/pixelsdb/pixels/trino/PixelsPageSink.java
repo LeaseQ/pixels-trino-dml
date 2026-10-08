@@ -191,7 +191,22 @@ final class PixelsPageSink
             return CompletableFuture.completedFuture(List.of());
         }
         catch (IOException e) {
+            try {
+                abort();
+            }
+            catch (RuntimeException cleanupFailure) {
+                e.addSuppressed(cleanupFailure);
+            }
             throw new TrinoException(PIXELS_WRITER_ERROR, "failed to close Pixels INSERT writer", e);
+        }
+        catch (RuntimeException e) {
+            try {
+                abort();
+            }
+            catch (RuntimeException cleanupFailure) {
+                e.addSuppressed(cleanupFailure);
+            }
+            throw e;
         }
     }
 
