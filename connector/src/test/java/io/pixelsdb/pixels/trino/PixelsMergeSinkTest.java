@@ -39,8 +39,6 @@ class PixelsMergeSinkTest
         sink.storeMergedRows(updatePage(11, 22));
 
         assertEquals(2, index.entries.size());
-        assertEquals("label", index.entries.get(0).columnName);
-        assertEquals("label", index.entries.get(1).columnName);
         assertArrayEquals(TypeDescription.fromString("long").convertSqlStringToByte("1"),
                 index.entries.get(0).tag);
         assertArrayEquals(TypeDescription.fromString("long").convertSqlStringToByte("11"),
@@ -107,17 +105,17 @@ class PixelsMergeSinkTest
         private final List<Entry> entries = new ArrayList<>();
 
         @Override
-        public void append(String columnName, byte[] tag, List<byte[]> primaryKeys)
+        public void append(byte[] tag, List<byte[]> primaryKeys)
         {
             for (byte[] primaryKey : primaryKeys)
             {
-                entries.add(new Entry(columnName, tag.clone(), primaryKey.clone()));
+                entries.add(new Entry(tag.clone(), primaryKey.clone()));
             }
         }
 
         @Override
         public void close() {}
 
-        private record Entry(String columnName, byte[] tag, byte[] primaryKey) {}
+        private record Entry(byte[] tag, byte[] primaryKey) {}
     }
 }

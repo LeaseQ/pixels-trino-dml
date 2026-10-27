@@ -1380,29 +1380,16 @@ public class PixelsSplitManager implements ConnectorSplitManager
 
     private boolean isTagPointLookupCandidate(PixelsTableHandle tableHandle)
     {
-        for (String tagColumnName : configuredTagColumns()) {
-            PixelsColumnHandle tagColumn = getIncludeColumns(tableHandle).stream()
-                    .filter(column -> column.getColumnName().equalsIgnoreCase(tagColumnName))
-                    .findFirst().orElse(null);
-            if (tagColumn != null && PixelsTagPointLookup.extractTagValue(
-                    tableHandle.getConstraint(), tagColumn).isPresent()) {
-                return true;
-            }
+        String tagColumnName = config.getConfigFactory().getProperty("dml.tag.column");
+        if (tagColumnName == null || tagColumnName.isBlank()) {
+            return false;
         }
-        return false;
-    }
-
-    private List<String> configuredTagColumns()
-    {
-        String columns = config.getConfigFactory().getProperty("dml.tag.columns");
-        if (columns == null || columns.isBlank()) {
-            columns = config.getConfigFactory().getProperty("dml.tag.column");
-        }
-        if (columns == null || columns.isBlank()) {
-            return List.of();
-        }
-        return Arrays.stream(columns.split(","))
-                .map(String::trim).filter(value -> !value.isEmpty()).toList();
+        PixelsColumnHandle tagColumn = getIncludeColumns(tableHandle).stream()
+                .filter(column -> column.getColumnName().equalsIgnoreCase(tagColumnName))
+                .findFirst()
+                .orElse(null);
+        return tagColumn != null && PixelsTagPointLookup.extractTagValue(
+                tableHandle.getConstraint(), tagColumn).isPresent();
     }
 
     /**
@@ -1420,18 +1407,14 @@ public class PixelsSplitManager implements ConnectorSplitManager
             TupleDomain<PixelsColumnHandle> constraint,
             List<PixelsColumnHandle> desiredColumns)
     {
-        String tagColumnName = null;
-        PixelsColumnHandle tagColumn = null;
-        for (String candidate : configuredTagColumns()) {
-            PixelsColumnHandle column = desiredColumns.stream()
-                    .filter(value -> value.getColumnName().equalsIgnoreCase(candidate))
-                    .findFirst().orElse(null);
-            if (column != null && PixelsTagPointLookup.extractTagValue(constraint, column).isPresent()) {
-                tagColumnName = candidate;
-                tagColumn = column;
-                break;
-            }
+        String tagColumnName = config.getConfigFactory().getProperty("dml.tag.column");
+        if (tagColumnName == null || tagColumnName.isBlank()) {
+            return null;
         }
+        PixelsColumnHandle tagColumn = desiredColumns.stream()
+                .filter(column -> column.getColumnName().equalsIgnoreCase(tagColumnName))
+                .findFirst()
+                .orElse(null);
         if (tagColumn == null) {
             return null;
         }
@@ -1458,7 +1441,7 @@ public class PixelsSplitManager implements ConnectorSplitManager
 
             IndexService indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.rpc);
             List<byte[]> primaryKeys = indexService.getTagIndexEntries(
-                            table.getId(), primaryIndex.getId(), tagColumnName, ByteString.copyFrom(tag)).stream()
+                            table.getId(), primaryIndex.getId(), ByteString.copyFrom(tag)).stream()
                     .map(ByteString::toByteArray)
                     .toList();
             if (primaryKeys.isEmpty()) {

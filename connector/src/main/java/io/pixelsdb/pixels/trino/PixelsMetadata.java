@@ -482,14 +482,13 @@ public class PixelsMetadata implements ConnectorMetadata
                         "Pixels UPDATE requires a primary index on " + pixelsTableHandle.getSchemaTableName());
             }
             IndexService indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.rpc);
-            long updated = PixelsUpdateExecutor.execute(updateHandle, primaryIndex, (columnName, tag, primaryKeys) -> {
+            long updated = PixelsUpdateExecutor.execute(updateHandle, primaryIndex, (tag, primaryKeys) -> {
                 try {
                     List<ByteString> encodedPrimaryKeys = primaryKeys.stream()
                             .map(ByteString::copyFrom)
                             .toList();
                     indexService.appendTagIndexEntries(table.getId(), primaryIndex.getId(), List.of(
                             io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
-                                    .setColumnName(columnName)
                                     .setTag(ByteString.copyFrom(tag))
                                     .addAllPrimaryKeys(encodedPrimaryKeys)
                                     .build()));
