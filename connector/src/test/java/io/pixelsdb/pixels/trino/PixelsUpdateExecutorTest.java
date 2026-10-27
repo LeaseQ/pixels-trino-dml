@@ -46,6 +46,7 @@ class PixelsUpdateExecutorTest
 
         assertEquals(1L, updated);
         assertEquals(1, index.entries.size());
+        assertEquals("label", index.entries.get(0).columnName);
         assertArrayEquals("vip".getBytes(), index.entries.get(0).tag);
         assertArrayEquals(TypeDescription.fromString("long").convertSqlStringToByte("7"),
                 index.entries.get(0).primaryKeys.get(0));
@@ -100,11 +101,11 @@ class PixelsUpdateExecutorTest
         private final List<Entry> entries = new ArrayList<>();
 
         @Override
-        public void append(byte[] tag, List<byte[]> primaryKeys)
+        public void append(String columnName, byte[] tag, List<byte[]> primaryKeys)
         {
-            entries.add(new Entry(tag, primaryKeys));
+            entries.add(new Entry(columnName, tag, primaryKeys));
         }
 
-        private record Entry(byte[] tag, List<byte[]> primaryKeys) {}
+        private record Entry(String columnName, byte[] tag, List<byte[]> primaryKeys) {}
     }
 }

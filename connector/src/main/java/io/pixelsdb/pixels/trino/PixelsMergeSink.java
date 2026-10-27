@@ -87,7 +87,8 @@ final class PixelsMergeSink implements ConnectorMergeSink
                     throw new TrinoException(PIXELS_INVERTED_INDEX_ERROR,
                             "updated column is not present in the merge page: " + updatedColumn.getColumnName());
                 }
-                tagIndex.append(encodeValue(updatedColumn, page.getBlock(dataIndex), position),
+                tagIndex.append(updatedColumn.getColumnName(),
+                        encodeValue(updatedColumn, page.getBlock(dataIndex), position),
                         List.of(primaryKey));
             }
         }
@@ -145,7 +146,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
 
     interface TagIndex
     {
-        void append(byte[] tag, List<byte[]> primaryKeys);
+        void append(String columnName, byte[] tag, List<byte[]> primaryKeys);
 
         void close();
     }
@@ -162,7 +163,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
         }
 
         @Override
-        public void append(byte[] tag, List<byte[]> primaryKeys)
+        public void append(String columnName, byte[] tag, List<byte[]> primaryKeys)
         {
             try
             {
@@ -171,6 +172,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
                         .toList();
                 indexService.appendTagIndexEntries(handle.getTableId(), handle.getIndexId(), List.of(
                         IndexProto.TagIndexUpdate.newBuilder()
+                                .setColumnName(columnName)
                                 .setTag(ByteString.copyFrom(tag))
                                 .addAllPrimaryKeys(encodedPrimaryKeys)
                                 .build()));

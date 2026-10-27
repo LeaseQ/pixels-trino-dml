@@ -31,7 +31,7 @@ final class PixelsUpdateExecutor
 
     interface TagIndex
     {
-        void append(byte[] tag, List<byte[]> primaryKeys);
+        void append(String columnName, byte[] tag, List<byte[]> primaryKeys);
     }
 
     static long execute(
@@ -54,7 +54,7 @@ final class PixelsUpdateExecutor
 
         for (Map.Entry<PixelsColumnHandle, Constant> assignment : update.getAssignments().entrySet()) {
             byte[] tag = encodeConstant(assignment.getKey(), assignment.getValue());
-            tagIndex.append(tag, List.of(primaryKey));
+            tagIndex.append(assignment.getKey().getColumnName(), tag, List.of(primaryKey));
         }
         return 1L;
     }
