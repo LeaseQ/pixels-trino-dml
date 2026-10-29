@@ -9,19 +9,15 @@ import io.airlift.slice.Slice;
 import io.pixelsdb.pixels.common.metadata.domain.KeyColumns;
 import io.pixelsdb.pixels.common.metadata.domain.SinglePointIndex;
 import io.pixelsdb.pixels.core.TypeDescription;
-import io.trino.spi.TrinoException;
-import io.trino.spi.expression.Constant;
 import io.trino.spi.predicate.NullableValue;
 import io.trino.spi.predicate.TupleDomain;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 import static io.pixelsdb.pixels.core.utils.PrimaryKeyBytes.concat;
-import static io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_DATA_TYPE_ERROR;
 import static java.util.Objects.requireNonNull;
 
 /** Executes the deliberately narrow, index-only Pixels UPDATE contract. */
@@ -52,8 +48,8 @@ final class PixelsUpdateExecutor
                         "Pixels UPDATE requires equality predicates for every primary-key column"));
         byte[] primaryKey = encodePrimaryKey(update, primaryIndex, fixedValues);
 
-        for (Map.Entry<PixelsColumnHandle, Constant> assignment : update.getAssignments().entrySet()) {
-            byte[] tag = encodeConstant(assignment.getKey(), assignment.getValue());
+        for (PixelsUpdateTableHandle.PixelsUpdateAssignment assignment : update.getAssignments()) {
+            byte[] tag = encodeAssignment(assignment.getColumn(), assignment.getValue());
             tagIndex.append(tag, List.of(primaryKey));
         }
         return 1L;
@@ -95,23 +91,16 @@ final class PixelsUpdateExecutor
         return concat(encodedParts.toArray(byte[][]::new));
     }
 
-    private static byte[] encodeConstant(PixelsColumnHandle column, Constant constant)
+    private static byte[] encodeAssignment(PixelsColumnHandle column, String value)
     {
-        if (!column.getColumnType().equals(constant.getType())) {
-            throw new TrinoException(PIXELS_DATA_TYPE_ERROR,
-                    "UPDATE value type does not match column " + column.getColumnName());
-        }
         return TypeDescription.fromString(column.getColumnType().getDisplayName())
-                .convertSqlStringToByte(toSqlString(constant.getValue()));
+                .convertSqlStringToByte(value);
     }
 
     private static String toSqlString(Object value)
     {
         if (value instanceof Slice slice) {
             return slice.toStringUtf8();
-        }
-        if (value instanceof byte[] bytes) {
-            return new String(bytes, StandardCharsets.UTF_8);
         }
         return String.valueOf(value);
     }

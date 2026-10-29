@@ -54,6 +54,7 @@ import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.Constant;
 import io.trino.spi.expression.Variable;
 import io.trino.spi.predicate.TupleDomain;
+import io.trino.spi.predicate.Domain;
 import io.trino.spi.security.TrinoPrincipal;
 import io.trino.spi.statistics.ColumnStatistics;
 import io.trino.spi.statistics.DoubleRange;
@@ -870,17 +871,21 @@ public class PixelsMetadata implements ConnectorMetadata
     public Optional<ConstraintApplicationResult<ConnectorTableHandle>> applyFilter(
             ConnectorSession session, ConnectorTableHandle handle, Constraint constraint)
     {
-        if (transHandle.getExecutorType() != ExecutorType.CF)
-        {
-            // Issue #60: Trino's filters are currently more efficient, so pushdown should only be used for pixels-turbo.
-            return Optional.empty();
-        }
-
         PixelsTableHandle tableHandle = (PixelsTableHandle) handle;
-
         TupleDomain<PixelsColumnHandle> oldDomain = tableHandle.getConstraint();
         TupleDomain<PixelsColumnHandle> newDomain = oldDomain.intersect(constraint.getSummary()
                 .transformKeys(PixelsColumnHandle.class::cast));
+
+        if (transHandle.getExecutorType() != ExecutorType.CF)
+        {
+            // Keep the normal scan path for complex predicates. Exact primary-key
+            // predicates are safe to enforce in the table handle and allow the
+            // UPDATE pushdown rule to use PixelsUpdateExecutor without scanning.
+            if (!isExactPrimaryKeyConstraint(tableHandle, newDomain))
+            {
+                return Optional.empty();
+            }
+        }
         TupleDomain<ColumnHandle> remainingFilter;
 
         if (newDomain.isNone())
@@ -909,6 +914,39 @@ public class PixelsMetadata implements ConnectorMetadata
         logger.debug("filter push down on " + newDomain.toString(session));
         return Optional.of(new ConstraintApplicationResult<>(
                 tableHandle, remainingFilter, constraint.getExpression(), false));
+    }
+
+    private boolean isExactPrimaryKeyConstraint(
+            PixelsTableHandle tableHandle, TupleDomain<PixelsColumnHandle> domain)
+    {
+        if (domain.isNone() || domain.getDomains().isEmpty())
+        {
+            return false;
+        }
+        try
+        {
+            List<PixelsColumnHandle> primaryKeyColumns = resolvePrimaryKeyColumns(tableHandle);
+            Map<PixelsColumnHandle, Domain> domains = domain.getDomains().orElseThrow();
+            if (domains.size() != primaryKeyColumns.size() ||
+                    !domains.keySet().containsAll(primaryKeyColumns))
+            {
+                return false;
+            }
+            for (PixelsColumnHandle column : primaryKeyColumns)
+            {
+                Domain keyDomain = domains.get(column);
+                if (keyDomain == null || !keyDomain.isSingleValue() || keyDomain.isNullAllowed())
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        catch (MetadataException e)
+        {
+            throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
+                    "failed to resolve the Pixels UPDATE primary key", e);
+        }
     }
 
     @Override
