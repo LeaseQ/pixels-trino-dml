@@ -13,7 +13,6 @@ import io.trino.spi.TrinoException;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -184,9 +183,6 @@ final class PixelsUpdateExecutor
     {
         if (value instanceof Slice slice) {
             return slice.toStringUtf8();
-        }
-        if (value instanceof byte[] bytes) {
-            return new String(bytes, StandardCharsets.UTF_8);
         }
         return String.valueOf(value);
     }

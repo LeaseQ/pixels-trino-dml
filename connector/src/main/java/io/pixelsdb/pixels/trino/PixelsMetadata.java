@@ -55,6 +55,7 @@ import io.trino.spi.expression.Constant;
 import io.trino.spi.expression.Variable;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
+import io.trino.spi.predicate.Domain;
 import io.trino.spi.security.TrinoPrincipal;
 import io.trino.spi.statistics.ColumnStatistics;
 import io.trino.spi.statistics.DoubleRange;
@@ -872,7 +873,6 @@ public class PixelsMetadata implements ConnectorMetadata
             ConnectorSession session, ConnectorTableHandle handle, Constraint constraint)
     {
         PixelsTableHandle tableHandle = (PixelsTableHandle) handle;
-
         TupleDomain<PixelsColumnHandle> oldDomain = tableHandle.getConstraint();
         TupleDomain<PixelsColumnHandle> newDomain = oldDomain.intersect(constraint.getSummary()
                 .transformKeys(PixelsColumnHandle.class::cast));

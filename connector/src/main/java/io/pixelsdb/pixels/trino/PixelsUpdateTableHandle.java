@@ -30,7 +30,7 @@ public final class PixelsUpdateTableHandle implements ConnectorTableHandle
     private final Map<String, String> assignments;
     private final List<PixelsColumnHandle> primaryKeyColumns;
 
-    public PixelsUpdateTableHandle(PixelsTableHandle tableHandle, Map<PixelsColumnHandle, Constant> assignments)
+    public PixelsUpdateTableHandle(PixelsTableHandle tableHandle, Map<PixelsColumnHandle, ?> assignments)
     {
         this(tableHandle, serializeAssignments(assignments), List.of());
     }
@@ -50,7 +50,7 @@ public final class PixelsUpdateTableHandle implements ConnectorTableHandle
             @JsonProperty("primaryKeyColumns") List<PixelsColumnHandle> primaryKeyColumns)
     {
         this.tableHandle = requireNonNull(tableHandle, "tableHandle is null");
-        this.assignments = Map.copyOf(requireNonNull(assignments, "assignments is null"));
+        this.assignments = List.copyOf(requireNonNull(assignments, "assignments is null"));
         this.primaryKeyColumns = List.copyOf(requireNonNull(primaryKeyColumns, "primaryKeyColumns is null"));
     }
 
@@ -89,5 +89,40 @@ public final class PixelsUpdateTableHandle implements ConnectorTableHandle
     public List<PixelsColumnHandle> getPrimaryKeyColumns()
     {
         return primaryKeyColumns;
+    }
+
+    private static List<PixelsUpdateAssignment> normalizeAssignments(Map<PixelsColumnHandle, ?> assignments)
+    {
+        List<PixelsUpdateAssignment> normalized = new java.util.ArrayList<>();
+        for (Map.Entry<PixelsColumnHandle, ?> entry : requireNonNull(assignments, "assignments is null").entrySet()) {
+            Object value = requireNonNull(entry.getValue(), "assignment value is null");
+            if (value instanceof Constant constant) {
+                value = constant.getValue();
+            }
+            String text = value instanceof Slice slice ? slice.toStringUtf8() : String.valueOf(value);
+            normalized.add(new PixelsUpdateAssignment(entry.getKey(), text));
+        }
+        return normalized;
+    }
+
+    public static final class PixelsUpdateAssignment
+    {
+        private final PixelsColumnHandle column;
+        private final String value;
+
+        @JsonCreator
+        public PixelsUpdateAssignment(
+                @JsonProperty("column") PixelsColumnHandle column,
+                @JsonProperty("value") String value)
+        {
+            this.column = requireNonNull(column, "column is null");
+            this.value = requireNonNull(value, "value is null");
+        }
+
+        @JsonProperty
+        public PixelsColumnHandle getColumn() { return column; }
+
+        @JsonProperty
+        public String getValue() { return value; }
     }
 }
