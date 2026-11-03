@@ -10,8 +10,7 @@ import io.pixelsdb.pixels.common.metadata.domain.KeyColumns;
 import io.pixelsdb.pixels.common.metadata.domain.SinglePointIndex;
 import io.pixelsdb.pixels.core.TypeDescription;
 import io.trino.spi.TrinoException;
-import io.trino.spi.expression.Constant;
-import io.trino.spi.predicate.NullableValue;
+import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 
 import java.nio.charset.StandardCharsets;
@@ -21,18 +20,21 @@ import java.util.List;
 import java.util.Map;
 
 import static io.pixelsdb.pixels.core.utils.PrimaryKeyBytes.concat;
-import static io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_DATA_TYPE_ERROR;
 import static java.util.Objects.requireNonNull;
 
 /** Executes the deliberately narrow, index-only Pixels UPDATE contract. */
 final class PixelsUpdateExecutor
 {
+    private static final int MAX_INDEX_UPDATE_KEYS = 10_000;
+
     private PixelsUpdateExecutor() {}
 
     interface TagIndex
     {
-        void append(byte[] tag, List<byte[]> primaryKeys);
+        void append(List<TagUpdate> updates);
     }
+
+    record TagUpdate(byte[] tag, List<byte[]> primaryKeys) {}
 
     static long execute(
             PixelsUpdateTableHandle update,
@@ -47,22 +49,34 @@ final class PixelsUpdateExecutor
         if (constraint.isNone()) {
             return 0L;
         }
-        Map<PixelsColumnHandle, NullableValue> fixedValues = TupleDomain.extractFixedValues(constraint)
+        Map<PixelsColumnHandle, Domain> domains = constraint.getDomains()
                 .orElseThrow(() -> new IllegalArgumentException(
-                        "Pixels UPDATE requires equality predicates for every primary-key column"));
-        byte[] primaryKey = encodePrimaryKey(update, primaryIndex, fixedValues);
-
-        for (Map.Entry<PixelsColumnHandle, Constant> assignment : update.getAssignments().entrySet()) {
-            byte[] tag = encodeConstant(assignment.getKey(), assignment.getValue());
-            tagIndex.append(tag, List.of(primaryKey));
+                        "Pixels UPDATE requires primary-key predicates"));
+        List<PixelsColumnHandle> primaryKeyColumns = resolvePrimaryKeyColumns(update, primaryIndex);
+        if (domains.keySet().stream().anyMatch(column -> !primaryKeyColumns.contains(column))) {
+            throw new IllegalArgumentException(
+                    "Pixels UPDATE index path only supports predicates on primary-key columns");
         }
-        return 1L;
+        List<byte[]> primaryKeys = encodePrimaryKeys(primaryKeyColumns, domains);
+
+        List<TagUpdate> tagUpdates = new ArrayList<>(update.getAssignments().size());
+        for (Map.Entry<String, String> assignment : update.getAssignments().entrySet()) {
+            PixelsColumnHandle column = update.getTableHandle().getColumns().stream()
+                    .filter(item -> item.getColumnName().equalsIgnoreCase(assignment.getKey()))
+                    .findFirst()
+                    .orElseThrow(() -> new TrinoException(
+                            io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_DATA_TYPE_ERROR,
+                            "UPDATE column is not present in the table handle: " + assignment.getKey()));
+            byte[] tag = encodeAssignment(column, assignment.getValue());
+            tagUpdates.add(new TagUpdate(tag, primaryKeys));
+        }
+        tagIndex.append(tagUpdates);
+        return primaryKeys.size();
     }
 
-    private static byte[] encodePrimaryKey(
+    private static List<PixelsColumnHandle> resolvePrimaryKeyColumns(
             PixelsUpdateTableHandle update,
-            SinglePointIndex primaryIndex,
-            Map<PixelsColumnHandle, NullableValue> fixedValues)
+            SinglePointIndex primaryIndex)
     {
         KeyColumns keyColumns = primaryIndex.getKeyColumns();
         if (keyColumns == null || keyColumns.getKeyColumnIds().isEmpty()) {
@@ -74,35 +88,96 @@ final class PixelsUpdateExecutor
             columnsByOrdinal.put(column.getLogicalOrdinal(), column);
         }
 
-        List<byte[]> encodedParts = new ArrayList<>();
+        if (!primaryKeyColumns.isEmpty()) {
+            return primaryKeyColumns;
+        }
+        primaryKeyColumns = new ArrayList<>();
         for (int keyIndex = 0; keyIndex < keyColumns.getKeyColumnIds().size(); keyIndex++) {
             Integer keyColumnId = keyColumns.getKeyColumnIds().get(keyIndex);
-            PixelsColumnHandle column = primaryKeyColumns.isEmpty()
-                    ? columnsByOrdinal.getOrDefault(keyColumnId, columnsByOrdinal.get(keyColumnId - 1))
-                    : primaryKeyColumns.get(keyIndex);
+            PixelsColumnHandle column = columnsByOrdinal.getOrDefault(keyColumnId, columnsByOrdinal.get(keyColumnId - 1));
             if (column == null) {
                 throw new IllegalArgumentException("primary-key column is not present in the table handle: " + keyColumnId);
             }
-            NullableValue value = fixedValues.get(column);
-            if (value == null || value.isNull()) {
-                throw new IllegalArgumentException(
-                        "Pixels UPDATE requires a non-null equality predicate for primary-key column " +
-                                column.getColumnName());
-            }
-            encodedParts.add(TypeDescription.fromString(column.getColumnType().getDisplayName())
-                    .convertSqlStringToByte(toSqlString(value.getValue())));
+            primaryKeyColumns.add(column);
         }
-        return concat(encodedParts.toArray(byte[][]::new));
+        return primaryKeyColumns;
     }
 
-    private static byte[] encodeConstant(PixelsColumnHandle column, Constant constant)
+    private static List<byte[]> encodePrimaryKeys(
+            List<PixelsColumnHandle> primaryKeyColumns,
+            Map<PixelsColumnHandle, Domain> domains)
     {
-        if (!column.getColumnType().equals(constant.getType())) {
-            throw new TrinoException(PIXELS_DATA_TYPE_ERROR,
-                    "UPDATE value type does not match column " + column.getColumnName());
+        long keyCount = 1;
+        for (PixelsColumnHandle column : primaryKeyColumns) {
+            Domain domain = domains.get(column);
+            List<Object> values = valuesForDomain(domain);
+            if (domain == null || domain.isNullAllowed()) {
+                throw new IllegalArgumentException(
+                        "Pixels UPDATE requires finite non-null primary-key values for " + column.getColumnName());
+            }
+            keyCount *= values.size();
+            if (keyCount > MAX_INDEX_UPDATE_KEYS) {
+                throw new IllegalArgumentException("Pixels UPDATE primary-key batch is too large: " + keyCount);
+            }
         }
+        List<byte[]> result = new ArrayList<>((int) keyCount);
+        appendPrimaryKeys(primaryKeyColumns, domains, 0, new ArrayList<>(), result);
+        return result;
+    }
+
+    private static void appendPrimaryKeys(
+            List<PixelsColumnHandle> columns,
+            Map<PixelsColumnHandle, Domain> domains,
+            int columnIndex,
+            List<byte[]> parts,
+            List<byte[]> result)
+    {
+        if (columnIndex == columns.size()) {
+            result.add(concat(parts.toArray(byte[][]::new)));
+            return;
+        }
+        PixelsColumnHandle column = columns.get(columnIndex);
+        for (Object value : valuesForDomain(domains.get(column))) {
+            List<byte[]> next = new ArrayList<>(parts);
+            next.add(TypeDescription.fromString(column.getColumnType().getDisplayName())
+                    .convertSqlStringToByte(toSqlString(value)));
+            appendPrimaryKeys(columns, domains, columnIndex + 1, next, result);
+        }
+    }
+
+    private static List<Object> valuesForDomain(Domain domain)
+    {
+        if (domain == null || domain.isNullAllowed()) {
+            throw new IllegalArgumentException("Pixels UPDATE requires finite non-null primary-key values");
+        }
+        if (domain.getValues().isDiscreteSet()) {
+            return domain.getValues().getDiscreteSet();
+        }
+        if (domain.getType().getJavaType() != long.class) {
+            throw new IllegalArgumentException("Pixels UPDATE only expands finite integer ranges");
+        }
+        List<Object> values = new ArrayList<>();
+        for (io.trino.spi.predicate.Range range : domain.getValues().getRanges().getOrderedRanges()) {
+            if (range.isLowUnbounded() || range.isHighUnbounded() ||
+                    !range.isLowInclusive() || !range.isHighInclusive()) {
+                throw new IllegalArgumentException("Pixels UPDATE requires bounded inclusive primary-key ranges");
+            }
+            long low = ((Number) range.getLowBoundedValue()).longValue();
+            long high = ((Number) range.getHighBoundedValue()).longValue();
+            if (high < low || high - low + 1 > MAX_INDEX_UPDATE_KEYS - values.size()) {
+                throw new IllegalArgumentException("Pixels UPDATE primary-key batch is too large");
+            }
+            for (long value = low; value <= high; value++) {
+                values.add(value);
+            }
+        }
+        return values;
+    }
+
+    private static byte[] encodeAssignment(PixelsColumnHandle column, String value)
+    {
         return TypeDescription.fromString(column.getColumnType().getDisplayName())
-                .convertSqlStringToByte(toSqlString(constant.getValue()));
+                .convertSqlStringToByte(value);
     }
 
     private static String toSqlString(Object value)

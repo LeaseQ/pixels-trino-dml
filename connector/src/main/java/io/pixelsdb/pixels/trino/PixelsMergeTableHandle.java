@@ -20,8 +20,19 @@ public final class PixelsMergeTableHandle implements ConnectorMergeTableHandle
     private final PixelsTableHandle tableHandle;
     private final long tableId;
     private final long indexId;
+    private final long transactionTimestamp;
     private final List<PixelsColumnHandle> primaryKeyColumns;
     private final List<PixelsColumnHandle> updatedColumns;
+
+    public PixelsMergeTableHandle(
+            PixelsTableHandle tableHandle,
+            long tableId,
+            long indexId,
+            List<PixelsColumnHandle> primaryKeyColumns,
+            List<PixelsColumnHandle> updatedColumns)
+    {
+        this(tableHandle, tableId, indexId, primaryKeyColumns, updatedColumns, 0L);
+    }
 
     @JsonCreator
     public PixelsMergeTableHandle(
@@ -29,11 +40,13 @@ public final class PixelsMergeTableHandle implements ConnectorMergeTableHandle
             @JsonProperty("tableId") long tableId,
             @JsonProperty("indexId") long indexId,
             @JsonProperty("primaryKeyColumns") List<PixelsColumnHandle> primaryKeyColumns,
-            @JsonProperty("updatedColumns") List<PixelsColumnHandle> updatedColumns)
+            @JsonProperty("updatedColumns") List<PixelsColumnHandle> updatedColumns,
+            @JsonProperty("transactionTimestamp") long transactionTimestamp)
     {
         this.tableHandle = requireNonNull(tableHandle, "tableHandle is null");
         this.tableId = tableId;
         this.indexId = indexId;
+        this.transactionTimestamp = transactionTimestamp;
         this.primaryKeyColumns = List.copyOf(requireNonNull(primaryKeyColumns, "primaryKeyColumns is null"));
         this.updatedColumns = List.copyOf(requireNonNull(updatedColumns, "updatedColumns is null"));
     }
@@ -55,6 +68,12 @@ public final class PixelsMergeTableHandle implements ConnectorMergeTableHandle
     public long getIndexId()
     {
         return indexId;
+    }
+
+    @JsonProperty
+    public long getTransactionTimestamp()
+    {
+        return transactionTimestamp;
     }
 
     @JsonProperty
