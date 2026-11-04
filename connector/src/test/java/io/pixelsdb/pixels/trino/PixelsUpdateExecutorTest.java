@@ -52,6 +52,41 @@ class PixelsUpdateExecutorTest
     }
 
     @Test
+    void writesAllPrimaryKeysForAnInPredicate()
+    {
+        PixelsColumnHandle id = column("id", BigintType.BIGINT, LONG, 0);
+        PixelsColumnHandle label = column("label", VarcharType.VARCHAR, STRING, 1);
+        PixelsUpdateTableHandle update = new PixelsUpdateTableHandle(
+                tableHandle(List.of(id, label), TupleDomain.withColumnDomains(Map.of(
+                        id, Domain.multipleValues(BigintType.BIGINT, List.of(7L, 9L, 11L))))),
+                Map.of(label, new Constant("vip", VarcharType.VARCHAR)));
+        RecordingTagIndex index = new RecordingTagIndex();
+
+        assertEquals(3L, PixelsUpdateExecutor.execute(update, primaryIndex(), index));
+        assertEquals(3, index.entries.get(0).primaryKeys.size());
+        assertArrayEquals(TypeDescription.fromString("long").convertSqlStringToByte("11"),
+                index.entries.get(0).primaryKeys.get(2));
+    }
+
+    @Test
+    void batchesMultipleAssignmentsFromOneStatement()
+    {
+        PixelsColumnHandle id = column("id", BigintType.BIGINT, LONG, 0);
+        PixelsColumnHandle first = column("first", VarcharType.VARCHAR, STRING, 1);
+        PixelsColumnHandle second = column("second", VarcharType.VARCHAR, STRING, 2);
+        PixelsUpdateTableHandle update = new PixelsUpdateTableHandle(
+                tableHandle(List.of(id, first, second), TupleDomain.withColumnDomains(Map.of(
+                        id, Domain.singleValue(BigintType.BIGINT, 7L)))),
+                Map.of(first, new Constant("A", VarcharType.VARCHAR),
+                        second, new Constant("B", VarcharType.VARCHAR)));
+        RecordingTagIndex index = new RecordingTagIndex();
+
+        assertEquals(1L, PixelsUpdateExecutor.execute(update, primaryIndex(), index));
+        assertEquals(1, index.batchCount);
+        assertEquals(2, index.entries.size());
+    }
+
+    @Test
     void rejectsAnUpdateThatCouldMatchMoreThanOnePrimaryKey()
     {
         PixelsColumnHandle id = column("id", BigintType.BIGINT, LONG, 0);
@@ -98,11 +133,13 @@ class PixelsUpdateExecutorTest
     private static final class RecordingTagIndex implements PixelsUpdateExecutor.TagIndex
     {
         private final List<Entry> entries = new ArrayList<>();
+        private int batchCount;
 
         @Override
-        public void append(byte[] tag, List<byte[]> primaryKeys)
+        public void append(List<PixelsUpdateExecutor.TagUpdate> updates)
         {
-            entries.add(new Entry(tag, primaryKeys));
+            batchCount++;
+            updates.forEach(update -> entries.add(new Entry(update.tag(), update.primaryKeys())));
         }
 
         private record Entry(byte[] tag, List<byte[]> primaryKeys) {}

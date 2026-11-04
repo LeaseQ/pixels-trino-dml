@@ -46,9 +46,7 @@ class PixelsDmlContractTest
         PixelsUpdateTableHandle update = new PixelsUpdateTableHandle(table, Map.of(label, value));
 
         assertSame(table, update.getTableHandle());
-        assertEquals(1, update.getAssignments().size());
-        assertEquals(label, update.getAssignments().get(0).getColumn());
-        assertEquals("vip", update.getAssignments().get(0).getValue());
+        assertEquals(Map.of("label", "vip"), update.getAssignments());
         assertTrue(update instanceof ConnectorTableHandle);
     }
 

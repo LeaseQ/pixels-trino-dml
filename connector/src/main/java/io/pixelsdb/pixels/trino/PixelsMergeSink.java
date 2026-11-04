@@ -20,9 +20,13 @@ import io.trino.spi.type.Type;
 import io.trino.spi.type.TinyintType;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 import static io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR;
@@ -66,6 +70,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
         int rowIdChannel = dataColumns.size() + 2;
         Block operationBlock = page.getBlock(operationChannel);
         Block rowIdBlock = page.getBlock(rowIdChannel);
+        Map<ByteBuffer, TagUpdateBuilder> pending = new LinkedHashMap<>();
         for (int position = 0; position < page.getPositionCount(); position++)
         {
             if (operationBlock.isNull(position))
@@ -87,10 +92,14 @@ final class PixelsMergeSink implements ConnectorMergeSink
                     throw new TrinoException(PIXELS_INVERTED_INDEX_ERROR,
                             "updated column is not present in the merge page: " + updatedColumn.getColumnName());
                 }
-                tagIndex.append(encodeValue(updatedColumn, page.getBlock(dataIndex), position),
-                        List.of(primaryKey));
+                byte[] tag = encodeValue(updatedColumn, page.getBlock(dataIndex), position);
+                pending.computeIfAbsent(ByteBuffer.wrap(tag), ignored -> new TagUpdateBuilder(tag))
+                        .primaryKeys.add(primaryKey);
             }
         }
+        tagIndex.appendBatch(handle.getTransactionTimestamp(), pending.values().stream()
+                .map(TagUpdateBuilder::build)
+                .toList());
     }
 
     @Override
@@ -143,12 +152,37 @@ final class PixelsMergeSink implements ConnectorMergeSink
         return TypeDescription.fromString(type.getDisplayName()).convertSqlStringToByte(value);
     }
 
+    private static final class TagUpdateBuilder
+    {
+        private final byte[] tag;
+        private final List<byte[]> primaryKeys = new ArrayList<>();
+
+        private TagUpdateBuilder(byte[] tag)
+        {
+            this.tag = tag;
+        }
+
+        private TagUpdate build()
+        {
+            return new TagUpdate(tag, List.copyOf(primaryKeys));
+        }
+    }
+
     interface TagIndex
     {
         void append(byte[] tag, List<byte[]> primaryKeys);
 
+        default void appendBatch(long transactionTimestamp, List<TagUpdate> updates)
+        {
+            for (TagUpdate update : updates) {
+                append(update.tag(), update.primaryKeys());
+            }
+        }
+
         void close();
     }
+
+    record TagUpdate(byte[] tag, List<byte[]> primaryKeys) {}
 
     private static final class RpcTagIndex implements TagIndex
     {
@@ -164,16 +198,23 @@ final class PixelsMergeSink implements ConnectorMergeSink
         @Override
         public void append(byte[] tag, List<byte[]> primaryKeys)
         {
+            appendBatch(handle.getTransactionTimestamp(), List.of(new TagUpdate(tag, primaryKeys)));
+        }
+
+        @Override
+        public void appendBatch(long transactionTimestamp, List<TagUpdate> updates)
+        {
             try
             {
-                List<ByteString> encodedPrimaryKeys = primaryKeys.stream()
-                        .map(ByteString::copyFrom)
+                List<IndexProto.TagIndexUpdate> requests = updates.stream()
+                        .map(update -> IndexProto.TagIndexUpdate.newBuilder()
+                                .setTag(ByteString.copyFrom(update.tag()))
+                                .addAllPrimaryKeys(update.primaryKeys().stream()
+                                        .map(ByteString::copyFrom).toList())
+                                .setTransactionTimestamp(transactionTimestamp)
+                                .build())
                         .toList();
-                indexService.appendTagIndexEntries(handle.getTableId(), handle.getIndexId(), List.of(
-                        IndexProto.TagIndexUpdate.newBuilder()
-                                .setTag(ByteString.copyFrom(tag))
-                                .addAllPrimaryKeys(encodedPrimaryKeys)
-                                .build()));
+                indexService.appendTagIndexEntries(handle.getTableId(), handle.getIndexId(), requests);
             }
             catch (IndexException e)
             {

@@ -53,6 +53,7 @@ import io.trino.spi.connector.*;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.Constant;
 import io.trino.spi.expression.Variable;
+import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.security.TrinoPrincipal;
@@ -324,13 +325,11 @@ public class PixelsMetadata implements ConnectorMetadata
                     requirePixelsColumn(assignment.getKey()),
                     requireNonNull(assignment.getValue(), "assignment value is null"));
         }
-        try
-        {
-            return Optional.of(new PixelsUpdateTableHandle(
+        try {
+            return Optional.of(PixelsUpdateTableHandle.withPrimaryKeyColumns(
                     pixelsTableHandle, pixelAssignments, resolvePrimaryKeyColumns(pixelsTableHandle)));
         }
-        catch (MetadataException e)
-        {
+        catch (MetadataException e) {
             throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
                     "failed to resolve the Pixels UPDATE primary key", e);
         }
@@ -409,7 +408,8 @@ public class PixelsMetadata implements ConnectorMetadata
             }
             return new PixelsMergeTableHandle(
                     pixelsTableHandle, table.getId(), primaryIndex.getId(),
-                    resolvePrimaryKeyColumns(pixelsTableHandle), updatedColumns);
+                    resolvePrimaryKeyColumns(pixelsTableHandle), updatedColumns,
+                    transHandle.getTimestamp());
         }
         catch (MetadataException e)
         {
@@ -483,16 +483,17 @@ public class PixelsMetadata implements ConnectorMetadata
                         "Pixels UPDATE requires a primary index on " + pixelsTableHandle.getSchemaTableName());
             }
             IndexService indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.rpc);
-            long updated = PixelsUpdateExecutor.execute(updateHandle, primaryIndex, (tag, primaryKeys) -> {
+            long updated = PixelsUpdateExecutor.execute(updateHandle, primaryIndex, updates -> {
                 try {
-                    List<ByteString> encodedPrimaryKeys = primaryKeys.stream()
-                            .map(ByteString::copyFrom)
+                    List<io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate> requests = updates.stream()
+                            .map(update -> io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
+                                    .setTag(ByteString.copyFrom(update.tag()))
+                                    .addAllPrimaryKeys(update.primaryKeys().stream()
+                                            .map(ByteString::copyFrom).toList())
+                                    .setTransactionTimestamp(transHandle.getTimestamp())
+                                    .build())
                             .toList();
-                    indexService.appendTagIndexEntries(table.getId(), primaryIndex.getId(), List.of(
-                            io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
-                                    .setTag(ByteString.copyFrom(tag))
-                                    .addAllPrimaryKeys(encodedPrimaryKeys)
-                                    .build()));
+                    indexService.appendTagIndexEntries(table.getId(), primaryIndex.getId(), requests);
                 }
                 catch (IndexException e) {
                     throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
@@ -875,16 +876,11 @@ public class PixelsMetadata implements ConnectorMetadata
         TupleDomain<PixelsColumnHandle> oldDomain = tableHandle.getConstraint();
         TupleDomain<PixelsColumnHandle> newDomain = oldDomain.intersect(constraint.getSummary()
                 .transformKeys(PixelsColumnHandle.class::cast));
-
-        if (transHandle.getExecutorType() != ExecutorType.CF)
+        boolean indexUpdateLookup = isFinitePrimaryKeyConstraint(tableHandle, newDomain);
+        if (transHandle.getExecutorType() != ExecutorType.CF && !indexUpdateLookup)
         {
-            // Keep the normal scan path for complex predicates. Exact primary-key
-            // predicates are safe to enforce in the table handle and allow the
-            // UPDATE pushdown rule to use PixelsUpdateExecutor without scanning.
-            if (!isExactPrimaryKeyConstraint(tableHandle, newDomain))
-            {
-                return Optional.empty();
-            }
+            // Keep the original MPP behavior except for exact primary-key UPDATE lookups.
+            return Optional.empty();
         }
         TupleDomain<ColumnHandle> remainingFilter;
 
@@ -916,37 +912,62 @@ public class PixelsMetadata implements ConnectorMetadata
                 tableHandle, remainingFilter, constraint.getExpression(), false));
     }
 
-    private boolean isExactPrimaryKeyConstraint(
-            PixelsTableHandle tableHandle, TupleDomain<PixelsColumnHandle> domain)
+    private boolean isFinitePrimaryKeyConstraint(
+            PixelsTableHandle tableHandle, TupleDomain<PixelsColumnHandle> constraint)
     {
-        if (domain.isNone() || domain.getDomains().isEmpty())
-        {
+        if (constraint.isNone() || constraint.getDomains().isEmpty()) {
             return false;
         }
-        try
-        {
-            List<PixelsColumnHandle> primaryKeyColumns = resolvePrimaryKeyColumns(tableHandle);
-            Map<PixelsColumnHandle, Domain> domains = domain.getDomains().orElseThrow();
-            if (domains.size() != primaryKeyColumns.size() ||
-                    !domains.keySet().containsAll(primaryKeyColumns))
-            {
+        try {
+            Map<PixelsColumnHandle, Domain> domains = constraint.getDomains().orElseThrow();
+            io.pixelsdb.pixels.common.metadata.domain.Table table = metadataProxy.getMetadataService()
+                    .getTable(tableHandle.getSchemaName(), tableHandle.getTableName());
+            SinglePointIndex index = metadataProxy.getMetadataService().getPrimaryIndex(table.getId());
+            if (index == null || index.getKeyColumns() == null ||
+                    domains.size() != index.getKeyColumns().getKeyColumnIds().size()) {
                 return false;
             }
-            for (PixelsColumnHandle column : primaryKeyColumns)
-            {
-                Domain keyDomain = domains.get(column);
-                if (keyDomain == null || !keyDomain.isSingleValue() || keyDomain.isNullAllowed())
-                {
-                    return false;
-                }
+            List<Column> columns = metadataProxy.getMetadataService().getColumns(
+                    tableHandle.getSchemaName(), tableHandle.getTableName(), false);
+            Set<Integer> keyIds = new HashSet<>(index.getKeyColumns().getKeyColumnIds());
+            return domains.entrySet().stream().allMatch(entry -> {
+                Optional<Column> column = columns.stream()
+                        .filter(item -> item.getName().equalsIgnoreCase(entry.getKey().getColumnName()))
+                        .findFirst();
+                return column.isPresent() && keyIds.contains((int) column.get().getId()) &&
+                        isFinitePrimaryKeyDomain(entry.getValue());
+            });
+        }
+        catch (MetadataException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    private static boolean isFinitePrimaryKeyDomain(Domain domain)
+    {
+        if (domain == null || domain.isNullAllowed()) {
+            return false;
+        }
+        if (domain.getValues().isDiscreteSet()) {
+            return domain.getValues().getDiscreteSet().size() <= 10_000;
+        }
+        if (domain.getType().getJavaType() != long.class) {
+            return false;
+        }
+        long count = 0;
+        for (io.trino.spi.predicate.Range range : domain.getValues().getRanges().getOrderedRanges()) {
+            if (range.isLowUnbounded() || range.isHighUnbounded() ||
+                    !range.isLowInclusive() || !range.isHighInclusive()) {
+                return false;
             }
-            return true;
+            long low = ((Number) range.getLowBoundedValue()).longValue();
+            long high = ((Number) range.getHighBoundedValue()).longValue();
+            if (high < low || high - low + 1 > 10_000 - count) {
+                return false;
+            }
+            count += high - low + 1;
         }
-        catch (MetadataException e)
-        {
-            throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
-                    "failed to resolve the Pixels UPDATE primary key", e);
-        }
+        return count > 0;
     }
 
     @Override
