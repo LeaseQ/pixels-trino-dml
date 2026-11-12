@@ -27,12 +27,14 @@ import static java.util.Objects.requireNonNull;
 public final class PixelsUpdateTableHandle implements ConnectorTableHandle
 {
     private final PixelsTableHandle tableHandle;
-    private final Map<String, String> assignments;
+    private final List<PixelsUpdateAssignment> assignments;
     private final List<PixelsColumnHandle> primaryKeyColumns;
+    private final long tableId;
+    private final long primaryIndexId;
 
     public PixelsUpdateTableHandle(PixelsTableHandle tableHandle, Map<PixelsColumnHandle, ?> assignments)
     {
-        this(tableHandle, serializeAssignments(assignments), List.of());
+        this(tableHandle, normalizeAssignments(assignments), List.of(), 0L, 0L);
     }
 
     public static PixelsUpdateTableHandle withPrimaryKeyColumns(
@@ -40,18 +42,33 @@ public final class PixelsUpdateTableHandle implements ConnectorTableHandle
             Map<PixelsColumnHandle, Constant> assignments,
             List<PixelsColumnHandle> primaryKeyColumns)
     {
-        return new PixelsUpdateTableHandle(tableHandle, serializeAssignments(assignments), primaryKeyColumns);
+        return new PixelsUpdateTableHandle(tableHandle, normalizeAssignments(assignments), primaryKeyColumns, 0L, 0L);
+    }
+
+    public static PixelsUpdateTableHandle withPrimaryKeyColumns(
+            PixelsTableHandle tableHandle,
+            Map<PixelsColumnHandle, Constant> assignments,
+            List<PixelsColumnHandle> primaryKeyColumns,
+            long tableId,
+            long primaryIndexId)
+    {
+        return new PixelsUpdateTableHandle(
+                tableHandle, normalizeAssignments(assignments), primaryKeyColumns, tableId, primaryIndexId);
     }
 
     @JsonCreator
     public PixelsUpdateTableHandle(
             @JsonProperty("tableHandle") PixelsTableHandle tableHandle,
-            @JsonProperty("assignments") Map<String, String> assignments,
-            @JsonProperty("primaryKeyColumns") List<PixelsColumnHandle> primaryKeyColumns)
+            @JsonProperty("assignments") List<PixelsUpdateAssignment> assignments,
+            @JsonProperty("primaryKeyColumns") List<PixelsColumnHandle> primaryKeyColumns,
+            @JsonProperty("tableId") long tableId,
+            @JsonProperty("primaryIndexId") long primaryIndexId)
     {
         this.tableHandle = requireNonNull(tableHandle, "tableHandle is null");
         this.assignments = List.copyOf(requireNonNull(assignments, "assignments is null"));
         this.primaryKeyColumns = List.copyOf(requireNonNull(primaryKeyColumns, "primaryKeyColumns is null"));
+        this.tableId = tableId;
+        this.primaryIndexId = primaryIndexId;
     }
 
     @JsonProperty
@@ -61,17 +78,9 @@ public final class PixelsUpdateTableHandle implements ConnectorTableHandle
     }
 
     @JsonProperty
-    public Map<String, String> getAssignments()
+    public List<PixelsUpdateAssignment> getAssignments()
     {
         return assignments;
-    }
-
-    private static Map<String, String> serializeAssignments(
-            Map<PixelsColumnHandle, Constant> assignments)
-    {
-        return assignments.entrySet().stream().collect(java.util.stream.Collectors.toUnmodifiableMap(
-                entry -> entry.getKey().getColumnName(),
-                entry -> toSqlString(entry.getValue().getValue())));
     }
 
     private static String toSqlString(Object value)
@@ -91,16 +100,28 @@ public final class PixelsUpdateTableHandle implements ConnectorTableHandle
         return primaryKeyColumns;
     }
 
+    @JsonProperty
+    public long getTableId()
+    {
+        return tableId;
+    }
+
+    @JsonProperty
+    public long getPrimaryIndexId()
+    {
+        return primaryIndexId;
+    }
+
     private static List<PixelsUpdateAssignment> normalizeAssignments(Map<PixelsColumnHandle, ?> assignments)
     {
         List<PixelsUpdateAssignment> normalized = new java.util.ArrayList<>();
         for (Map.Entry<PixelsColumnHandle, ?> entry : requireNonNull(assignments, "assignments is null").entrySet()) {
+            PixelsColumnHandle column = requireNonNull(entry.getKey(), "assignment column is null");
             Object value = requireNonNull(entry.getValue(), "assignment value is null");
             if (value instanceof Constant constant) {
                 value = constant.getValue();
             }
-            String text = value instanceof Slice slice ? slice.toStringUtf8() : String.valueOf(value);
-            normalized.add(new PixelsUpdateAssignment(entry.getKey(), text));
+            normalized.add(new PixelsUpdateAssignment(column, toSqlString(value)));
         }
         return normalized;
     }
