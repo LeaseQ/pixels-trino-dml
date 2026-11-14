@@ -35,6 +35,8 @@ final class PixelsUpdateExecutor
 
     record TagUpdate(byte[] tag, List<byte[]> primaryKeys) {}
 
+    record Result(long updatedRows, long encodingNanos) {}
+
     static long execute(
             PixelsUpdateTableHandle update,
             SinglePointIndex primaryIndex,
@@ -42,35 +44,47 @@ final class PixelsUpdateExecutor
     {
         requireNonNull(update, "update is null");
         requireNonNull(primaryIndex, "primaryIndex is null");
+        return executeWithMetrics(update, resolvePrimaryKeyColumns(update, primaryIndex), tagIndex).updatedRows();
+    }
+
+    static Result executeWithMetrics(
+            PixelsUpdateTableHandle update,
+            List<PixelsColumnHandle> primaryKeyColumns,
+            TagIndex tagIndex)
+    {
+        requireNonNull(update, "update is null");
+        requireNonNull(primaryKeyColumns, "primaryKeyColumns is null");
         requireNonNull(tagIndex, "tagIndex is null");
 
         TupleDomain<PixelsColumnHandle> constraint = update.getTableHandle().getConstraint();
         if (constraint.isNone()) {
-            return 0L;
+            return new Result(0L, 0L);
         }
         Map<PixelsColumnHandle, Domain> domains = constraint.getDomains()
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Pixels UPDATE requires primary-key predicates"));
-        List<PixelsColumnHandle> primaryKeyColumns = resolvePrimaryKeyColumns(update, primaryIndex);
         if (domains.keySet().stream().anyMatch(column -> !primaryKeyColumns.contains(column))) {
             throw new IllegalArgumentException(
                     "Pixels UPDATE index path only supports predicates on primary-key columns");
         }
+        long encodingStart = System.nanoTime();
         List<byte[]> primaryKeys = encodePrimaryKeys(primaryKeyColumns, domains);
 
         List<TagUpdate> tagUpdates = new ArrayList<>(update.getAssignments().size());
-        for (Map.Entry<String, String> assignment : update.getAssignments().entrySet()) {
+        for (PixelsUpdateTableHandle.PixelsUpdateAssignment assignment : update.getAssignments()) {
+            String columnName = assignment.getColumn().getColumnName();
             PixelsColumnHandle column = update.getTableHandle().getColumns().stream()
-                    .filter(item -> item.getColumnName().equalsIgnoreCase(assignment.getKey()))
+                    .filter(item -> item.getColumnName().equalsIgnoreCase(columnName))
                     .findFirst()
                     .orElseThrow(() -> new TrinoException(
                             io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_DATA_TYPE_ERROR,
-                            "UPDATE column is not present in the table handle: " + assignment.getKey()));
+                            "UPDATE column is not present in the table handle: " + columnName));
             byte[] tag = encodeAssignment(column, assignment.getValue());
             tagUpdates.add(new TagUpdate(tag, primaryKeys));
         }
+        long encodingNanos = System.nanoTime() - encodingStart;
         tagIndex.append(tagUpdates);
-        return primaryKeys.size();
+        return new Result(primaryKeys.size(), encodingNanos);
     }
 
     private static List<PixelsColumnHandle> resolvePrimaryKeyColumns(

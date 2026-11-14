@@ -81,8 +81,14 @@ import static java.util.stream.Collectors.toList;
 public class PixelsMetadata implements ConnectorMetadata
 {
     private static final Logger logger = Logger.get(PixelsMetadata.class);
+    private record PrimaryKeyResolution(long tableId, long indexId, List<PixelsColumnHandle> columns) {}
     private static final JsonCodec<ConnectorViewDefinition> ViewCodec =
             new JsonCodecFactory(new ObjectMapperProvider()).jsonCodec(ConnectorViewDefinition.class);
+
+    private static double nanosToMillis(long nanos)
+    {
+        return nanos / 1_000_000.0;
+    }
 
     private final String connectorId;
     private final PixelsMetadataProxy metadataProxy;
@@ -326,8 +332,13 @@ public class PixelsMetadata implements ConnectorMetadata
                     requireNonNull(assignment.getValue(), "assignment value is null"));
         }
         try {
+            long metadataStart = System.nanoTime();
+            PrimaryKeyResolution resolution = resolvePrimaryKeyResolution(pixelsTableHandle);
+            logger.info("[PIXELS_UPDATE_METRIC] table=%s phase=metadata metadata_ms=%.3f",
+                    pixelsTableHandle.getSchemaTableName(), nanosToMillis(System.nanoTime() - metadataStart));
             return Optional.of(PixelsUpdateTableHandle.withPrimaryKeyColumns(
-                    pixelsTableHandle, pixelAssignments, resolvePrimaryKeyColumns(pixelsTableHandle)));
+                    pixelsTableHandle, pixelAssignments, resolution.columns(),
+                    resolution.tableId(), resolution.indexId()));
         }
         catch (MetadataException e) {
             throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
@@ -433,7 +444,7 @@ public class PixelsMetadata implements ConnectorMetadata
         }
     }
 
-    private List<PixelsColumnHandle> resolvePrimaryKeyColumns(PixelsTableHandle tableHandle)
+    private PrimaryKeyResolution resolvePrimaryKeyResolution(PixelsTableHandle tableHandle)
             throws MetadataException
     {
         io.pixelsdb.pixels.common.metadata.domain.Table table = metadataProxy.getMetadataService()
@@ -463,7 +474,13 @@ public class PixelsMetadata implements ConnectorMetadata
                             "primary-key column is not present in the table handle: " + keyColumn.getName()));
             primaryKeyColumns.add(keyHandle);
         }
-        return List.copyOf(primaryKeyColumns);
+        return new PrimaryKeyResolution(table.getId(), primaryIndex.getId(), List.copyOf(primaryKeyColumns));
+    }
+
+    private List<PixelsColumnHandle> resolvePrimaryKeyColumns(PixelsTableHandle tableHandle)
+            throws MetadataException
+    {
+        return resolvePrimaryKeyResolution(tableHandle).columns();
     }
 
     @Override
@@ -474,16 +491,28 @@ public class PixelsMetadata implements ConnectorMetadata
                     "Pixels UPDATE received an invalid update handle");
         }
         PixelsTableHandle pixelsTableHandle = updateHandle.getTableHandle();
+        long totalStart = System.nanoTime();
+        long metadataNanos = 0L;
         try {
-            io.pixelsdb.pixels.common.metadata.domain.Table table = metadataProxy.getMetadataService()
-                    .getTable(pixelsTableHandle.getSchemaName(), pixelsTableHandle.getTableName());
-            SinglePointIndex primaryIndex = metadataProxy.getMetadataService().getPrimaryIndex(table.getId());
-            if (primaryIndex == null) {
-                throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
-                        "Pixels UPDATE requires a primary index on " + pixelsTableHandle.getSchemaTableName());
+            long tableId = updateHandle.getTableId();
+            long indexId = updateHandle.getPrimaryIndexId();
+            List<PixelsColumnHandle> primaryKeyColumns = updateHandle.getPrimaryKeyColumns();
+            if (tableId <= 0 || indexId <= 0 || primaryKeyColumns.isEmpty()) {
+                long metadataStart = System.nanoTime();
+                PrimaryKeyResolution resolution = resolvePrimaryKeyResolution(pixelsTableHandle);
+                metadataNanos = System.nanoTime() - metadataStart;
+                tableId = resolution.tableId();
+                indexId = resolution.indexId();
+                primaryKeyColumns = resolution.columns();
             }
+            final long resolvedTableId = tableId;
+            final long resolvedIndexId = indexId;
+            final List<PixelsColumnHandle> resolvedPrimaryKeyColumns = primaryKeyColumns;
             IndexService indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.rpc);
-            long updated = PixelsUpdateExecutor.execute(updateHandle, primaryIndex, updates -> {
+            final long[] rpcNanos = {0L};
+            PixelsUpdateExecutor.Result result = PixelsUpdateExecutor.executeWithMetrics(
+                    updateHandle, resolvedPrimaryKeyColumns, updates -> {
+                long rpcStart = System.nanoTime();
                 try {
                     List<io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate> requests = updates.stream()
                             .map(update -> io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
@@ -493,14 +522,21 @@ public class PixelsMetadata implements ConnectorMetadata
                                     .setTransactionTimestamp(transHandle.getTimestamp())
                                     .build())
                             .toList();
-                    indexService.appendTagIndexEntries(table.getId(), primaryIndex.getId(), requests);
+                    indexService.appendTagIndexEntries(resolvedTableId, resolvedIndexId, requests);
                 }
                 catch (IndexException e) {
                     throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
                             "failed to append Pixels UPDATE tag index through IndexServer", e);
                 }
+                finally {
+                    rpcNanos[0] += System.nanoTime() - rpcStart;
+                }
             });
-            return OptionalLong.of(updated);
+            logger.info("[PIXELS_UPDATE_METRIC] table=%s rows=%d metadata_ms=%.3f encoding_ms=%.3f rpc_ms=%.3f total_ms=%.3f",
+                    pixelsTableHandle.getSchemaTableName(), result.updatedRows(),
+                    nanosToMillis(metadataNanos), nanosToMillis(result.encodingNanos()),
+                    nanosToMillis(rpcNanos[0]), nanosToMillis(System.nanoTime() - totalStart));
+            return OptionalLong.of(result.updatedRows());
         }
         catch (MetadataException e) {
             throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,

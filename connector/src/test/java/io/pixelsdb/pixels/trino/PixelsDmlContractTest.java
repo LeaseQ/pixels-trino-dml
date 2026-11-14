@@ -5,6 +5,11 @@
  */
 package io.pixelsdb.pixels.trino;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.airlift.json.JsonCodec;
+import io.airlift.json.JsonCodecFactory;
+import io.airlift.json.ObjectMapperProvider;
 import io.pixelsdb.pixels.common.physical.Storage;
 import io.pixelsdb.pixels.core.TypeDescription;
 import io.pixelsdb.pixels.planner.plan.logical.Table;
@@ -46,8 +51,29 @@ class PixelsDmlContractTest
         PixelsUpdateTableHandle update = new PixelsUpdateTableHandle(table, Map.of(label, value));
 
         assertSame(table, update.getTableHandle());
-        assertEquals(Map.of("label", "vip"), update.getAssignments());
+        assertEquals(1, update.getAssignments().size());
+        assertEquals(label, update.getAssignments().get(0).getColumn());
+        assertEquals("vip", update.getAssignments().get(0).getValue());
         assertTrue(update instanceof ConnectorTableHandle);
+    }
+
+    @Test
+    void updateHandleSerializesAssignmentsAndResolvedIndexIds() throws Exception
+    {
+        PixelsTableHandle table = tableHandle();
+        PixelsColumnHandle label = column("label", 1);
+        PixelsUpdateTableHandle update = PixelsUpdateTableHandle.withPrimaryKeyColumns(
+                table, Map.of(label, new Constant("vip", VarcharType.VARCHAR)), List.of(label), 22L, 11L);
+        JsonCodec<PixelsUpdateTableHandle> codec = new JsonCodecFactory(new ObjectMapperProvider())
+                .jsonCodec(PixelsUpdateTableHandle.class);
+
+        JsonNode serialized = new ObjectMapper().readTree(codec.toJson(update));
+
+        assertTrue(serialized.get("assignments").isArray());
+        assertEquals("label", serialized.get("assignments").get(0).get("column").get("columnName").asText());
+        assertEquals("vip", serialized.get("assignments").get(0).get("value").asText());
+        assertEquals(22L, serialized.get("tableId").asLong());
+        assertEquals(11L, serialized.get("primaryIndexId").asLong());
     }
 
     private static PixelsTableHandle tableHandle()
