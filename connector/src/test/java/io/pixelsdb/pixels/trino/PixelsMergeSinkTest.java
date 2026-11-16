@@ -37,6 +37,8 @@ class PixelsMergeSinkTest
         PixelsMergeSink sink = new PixelsMergeSink(mergeHandle(id, label), index);
 
         sink.storeMergedRows(updatePage(11, 22));
+        assertEquals(0, index.entries.size());
+        sink.finish();
 
         assertEquals(2, index.entries.size());
         assertArrayEquals(TypeDescription.fromString("long").convertSqlStringToByte("1"),
@@ -47,6 +49,45 @@ class PixelsMergeSinkTest
                 index.entries.get(1).tag);
         assertArrayEquals(TypeDescription.fromString("long").convertSqlStringToByte("22"),
                 index.entries.get(1).primaryKey);
+    }
+
+    @Test
+    void sendsAllPagesAsOneTagIndexBatchWhenTheMergeFinishes()
+    {
+        PixelsColumnHandle id = column("id", 0);
+        PixelsColumnHandle label = column("label", 1);
+        RecordingTagIndex index = new RecordingTagIndex();
+        PixelsMergeSink sink = new PixelsMergeSink(mergeHandle(id, label), index);
+
+        sink.storeMergedRows(updatePage(11));
+        sink.storeMergedRows(updatePage(22));
+
+        assertEquals(0, index.batchCount);
+        sink.finish();
+
+        assertEquals(1, index.batchCount);
+        assertEquals(2, index.entries.size());
+    }
+
+    @Test
+    void boundsTheNumberOfDistinctTagsRetainedInOneBatch()
+    {
+        assertEquals(65_536, PixelsMergeSink.MAX_PENDING_TAGS);
+        PixelsColumnHandle id = column("id", 0);
+        PixelsColumnHandle label = column("label", 1);
+        RecordingTagIndex index = new RecordingTagIndex();
+        PixelsMergeSink sink = new PixelsMergeSink(mergeHandle(id, label), index);
+
+        long[] primaryKeys = new long[PixelsMergeSink.MAX_PENDING_TAGS + 1];
+        for (int i = 0; i < primaryKeys.length; i++)
+        {
+            primaryKeys[i] = i;
+        }
+        sink.storeMergedRows(updatePageWithTags(primaryKeys));
+        sink.finish();
+
+        assertEquals(2, index.batchCount);
+        assertEquals(primaryKeys.length, index.entries.size());
     }
 
     @Test
@@ -73,7 +114,16 @@ class PixelsMergeSinkTest
     {
         byte[] operations = new byte[primaryKeys.length];
         java.util.Arrays.fill(operations, (byte) ConnectorMergeSink.UPDATE_OPERATION_NUMBER);
-        return page(primaryKeys, operations);
+        long[] tags = new long[primaryKeys.length];
+        java.util.Arrays.fill(tags, 1L);
+        return page(primaryKeys, tags, operations);
+    }
+
+    private static Page updatePageWithTags(long[] primaryKeys)
+    {
+        byte[] operations = new byte[primaryKeys.length];
+        java.util.Arrays.fill(operations, (byte) ConnectorMergeSink.UPDATE_OPERATION_NUMBER);
+        return page(primaryKeys, primaryKeys.clone(), operations);
     }
 
     private static Page updatePageWithOperation(byte operation, long primaryKey)
@@ -85,6 +135,11 @@ class PixelsMergeSinkTest
     {
         long[] tags = new long[primaryKeys.length];
         java.util.Arrays.fill(tags, 1L);
+        return page(primaryKeys, tags, operations);
+    }
+
+    private static Page page(long[] primaryKeys, long[] tags, byte[] operations)
+    {
         int[] mergeCases = new int[primaryKeys.length];
         return new Page(
                 new LongArrayBlock(primaryKeys.length, Optional.empty(), primaryKeys),
@@ -103,6 +158,7 @@ class PixelsMergeSinkTest
     private static final class RecordingTagIndex implements PixelsMergeSink.TagIndex
     {
         private final List<Entry> entries = new ArrayList<>();
+        private int batchCount;
 
         @Override
         public void append(byte[] tag, List<byte[]> primaryKeys)
@@ -111,6 +167,13 @@ class PixelsMergeSinkTest
             {
                 entries.add(new Entry(tag.clone(), primaryKey.clone()));
             }
+        }
+
+        @Override
+        public void appendBatch(long transactionTimestamp, List<PixelsMergeSink.TagUpdate> updates)
+        {
+            batchCount++;
+            PixelsMergeSink.TagIndex.super.appendBatch(transactionTimestamp, updates);
         }
 
         @Override

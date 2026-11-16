@@ -55,7 +55,6 @@ import io.trino.spi.expression.Constant;
 import io.trino.spi.expression.Variable;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
-import io.trino.spi.predicate.Domain;
 import io.trino.spi.security.TrinoPrincipal;
 import io.trino.spi.statistics.ColumnStatistics;
 import io.trino.spi.statistics.DoubleRange;
@@ -336,6 +335,21 @@ public class PixelsMetadata implements ConnectorMetadata
             PrimaryKeyResolution resolution = resolvePrimaryKeyResolution(pixelsTableHandle);
             logger.info("[PIXELS_UPDATE_METRIC] table=%s phase=metadata metadata_ms=%.3f",
                     pixelsTableHandle.getSchemaTableName(), nanosToMillis(System.nanoTime() - metadataStart));
+            Map<PixelsColumnHandle, Domain> domains = pixelsTableHandle.getConstraint().getDomains()
+                    .orElse(Map.of());
+            boolean exactEligible = PixelsUpdateExecutor.isFinitePrimaryKeyConstraint(
+                    resolution.columns(), domains);
+            logger.info("[PIXELS_UPDATE_ROUTE] table=%s phase=apply_update executor=%s exact_eligible=%s " +
+                            "domain_count=%d domain_summary=%s primary_key_count=%d",
+                    pixelsTableHandle.getSchemaTableName(), transHandle.getExecutorType(), exactEligible,
+                    domains.size(), summarizePrimaryKeyDomains(resolution.columns(), domains),
+                    resolution.columns().size());
+            if (!exactEligible)
+            {
+                // Leave the MergeWriter plan intact so Trino uses the
+                // worker-side MergeSink fallback for non-indexable predicates.
+                return Optional.empty();
+            }
             return Optional.of(PixelsUpdateTableHandle.withPrimaryKeyColumns(
                     pixelsTableHandle, pixelAssignments, resolution.columns(),
                     resolution.tableId(), resolution.indexId()));
@@ -417,9 +431,14 @@ public class PixelsMetadata implements ConnectorMetadata
                 throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
                         "Pixels UPDATE requires a primary index on " + pixelsTableHandle.getSchemaTableName());
             }
+            List<PixelsColumnHandle> primaryKeyColumns = resolvePrimaryKeyColumns(pixelsTableHandle);
+            logger.info("[PIXELS_UPDATE_ROUTE] table=%s phase=begin_merge path=merge_fallback " +
+                            "updated_column_count=%d primary_key_count=%d",
+                    pixelsTableHandle.getSchemaTableName(), updatedColumns.size(),
+                    primaryKeyColumns.size());
             return new PixelsMergeTableHandle(
                     pixelsTableHandle, table.getId(), primaryIndex.getId(),
-                    resolvePrimaryKeyColumns(pixelsTableHandle), updatedColumns,
+                    primaryKeyColumns, updatedColumns,
                     transHandle.getTimestamp());
         }
         catch (MetadataException e)
@@ -510,31 +529,48 @@ public class PixelsMetadata implements ConnectorMetadata
             final List<PixelsColumnHandle> resolvedPrimaryKeyColumns = primaryKeyColumns;
             IndexService indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.rpc);
             final long[] rpcNanos = {0L};
+            final long[] rpcCount = {0L};
+            final long[] requestBytes = {0L};
+            final long[] requestBuildNanos = {0L};
             PixelsUpdateExecutor.Result result = PixelsUpdateExecutor.executeWithMetrics(
                     updateHandle, resolvedPrimaryKeyColumns, updates -> {
-                long rpcStart = System.nanoTime();
+                long requestStart = System.nanoTime();
                 try {
-                    List<io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate> requests = updates.stream()
-                            .map(update -> io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
-                                    .setTag(ByteString.copyFrom(update.tag()))
-                                    .addAllPrimaryKeys(update.primaryKeys().stream()
-                                            .map(ByteString::copyFrom).toList())
-                                    .setTransactionTimestamp(transHandle.getTimestamp())
-                                    .build())
-                            .toList();
+                    List<io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate> requests =
+                            new ArrayList<>(updates.size());
+                    for (PixelsUpdateExecutor.TagUpdate update : updates) {
+                        io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.Builder builder =
+                                io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
+                                        .setTag(ByteString.copyFrom(update.tag()))
+                                        .setTransactionTimestamp(transHandle.getTimestamp());
+                        for (byte[] primaryKey : update.primaryKeys()) {
+                            builder.addPrimaryKeys(ByteString.copyFrom(primaryKey));
+                        }
+                        requests.add(builder.build());
+                    }
+                    io.pixelsdb.pixels.index.IndexProto.AppendTagIndexEntriesRequest request =
+                            io.pixelsdb.pixels.index.IndexProto.AppendTagIndexEntriesRequest.newBuilder()
+                                    .setTableId(resolvedTableId)
+                                    .setIndexId(resolvedIndexId)
+                                    .addAllUpdates(requests)
+                                    .build();
+                    requestBytes[0] += request.getSerializedSize();
+                    requestBuildNanos[0] += System.nanoTime() - requestStart;
+                    long rpcStart = System.nanoTime();
+                    rpcCount[0]++;
                     indexService.appendTagIndexEntries(resolvedTableId, resolvedIndexId, requests);
+                    rpcNanos[0] += System.nanoTime() - rpcStart;
                 }
                 catch (IndexException e) {
                     throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
                             "failed to append Pixels UPDATE tag index through IndexServer", e);
                 }
-                finally {
-                    rpcNanos[0] += System.nanoTime() - rpcStart;
-                }
             });
-            logger.info("[PIXELS_UPDATE_METRIC] table=%s rows=%d metadata_ms=%.3f encoding_ms=%.3f rpc_ms=%.3f total_ms=%.3f",
+            logger.info("[PIXELS_UPDATE_METRIC] table=%s rows=%d metadata_ms=%.3f encoding_ms=%.3f " +
+                            "request_build_ms=%.3f rpc_count=%d request_bytes=%d rpc_ms=%.3f total_ms=%.3f",
                     pixelsTableHandle.getSchemaTableName(), result.updatedRows(),
-                    nanosToMillis(metadataNanos), nanosToMillis(result.encodingNanos()),
+                    nanosToMillis(metadataNanos), nanosToMillis(result.encodingNanos()), rpcCount[0],
+                    nanosToMillis(requestBuildNanos[0]), requestBytes[0],
                     nanosToMillis(rpcNanos[0]), nanosToMillis(System.nanoTime() - totalStart));
             return OptionalLong.of(result.updatedRows());
         }
@@ -557,6 +593,27 @@ public class PixelsMetadata implements ConnectorMetadata
                     "DML is only supported for a base Pixels table");
         }
         return pixelsTableHandle;
+    }
+
+    private static String summarizePrimaryKeyDomains(
+            List<PixelsColumnHandle> primaryKeyColumns,
+            Map<PixelsColumnHandle, Domain> domains)
+    {
+        List<String> summary = new ArrayList<>(primaryKeyColumns.size());
+        for (PixelsColumnHandle column : primaryKeyColumns)
+        {
+            Domain domain = domains.get(column);
+            long cardinality = domain == null ? -1L : PixelsUpdateExecutor.finitePrimaryKeyCardinality(domain);
+            summary.add(column.getColumnName() + "=" + cardinality);
+        }
+        return String.join(",", summary);
+    }
+
+    static boolean isExactUpdateEligible(
+            List<PixelsColumnHandle> primaryKeyColumns,
+            Map<PixelsColumnHandle, Domain> domains)
+    {
+        return PixelsUpdateExecutor.isFinitePrimaryKeyConstraint(primaryKeyColumns, domains);
     }
 
     private static PixelsColumnHandle requirePixelsColumn(ColumnHandle columnHandle)
@@ -965,45 +1022,30 @@ public class PixelsMetadata implements ConnectorMetadata
             }
             List<Column> columns = metadataProxy.getMetadataService().getColumns(
                     tableHandle.getSchemaName(), tableHandle.getTableName(), false);
-            Set<Integer> keyIds = new HashSet<>(index.getKeyColumns().getKeyColumnIds());
-            return domains.entrySet().stream().allMatch(entry -> {
+            List<PixelsColumnHandle> primaryKeyColumns = new ArrayList<>();
+            for (Integer keyColumnId : index.getKeyColumns().getKeyColumnIds())
+            {
                 Optional<Column> column = columns.stream()
-                        .filter(item -> item.getName().equalsIgnoreCase(entry.getKey().getColumnName()))
+                        .filter(item -> item.getId() == keyColumnId)
                         .findFirst();
-                return column.isPresent() && keyIds.contains((int) column.get().getId()) &&
-                        isFinitePrimaryKeyDomain(entry.getValue());
-            });
+                if (column.isEmpty())
+                {
+                    return false;
+                }
+                Optional<PixelsColumnHandle> handle = tableHandle.getColumns().stream()
+                        .filter(item -> item.getColumnName().equalsIgnoreCase(column.get().getName()))
+                        .findFirst();
+                if (handle.isEmpty())
+                {
+                    return false;
+                }
+                primaryKeyColumns.add(handle.get());
+            }
+            return isExactUpdateEligible(primaryKeyColumns, domains);
         }
         catch (MetadataException | RuntimeException e) {
             return false;
         }
-    }
-
-    private static boolean isFinitePrimaryKeyDomain(Domain domain)
-    {
-        if (domain == null || domain.isNullAllowed()) {
-            return false;
-        }
-        if (domain.getValues().isDiscreteSet()) {
-            return domain.getValues().getDiscreteSet().size() <= 10_000;
-        }
-        if (domain.getType().getJavaType() != long.class) {
-            return false;
-        }
-        long count = 0;
-        for (io.trino.spi.predicate.Range range : domain.getValues().getRanges().getOrderedRanges()) {
-            if (range.isLowUnbounded() || range.isHighUnbounded() ||
-                    !range.isLowInclusive() || !range.isHighInclusive()) {
-                return false;
-            }
-            long low = ((Number) range.getLowBoundedValue()).longValue();
-            long high = ((Number) range.getHighBoundedValue()).longValue();
-            if (high < low || high - low + 1 > 10_000 - count) {
-                return false;
-            }
-            count += high - low + 1;
-        }
-        return count > 0;
     }
 
     @Override

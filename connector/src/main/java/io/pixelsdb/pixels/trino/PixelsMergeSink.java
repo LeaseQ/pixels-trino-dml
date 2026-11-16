@@ -5,8 +5,9 @@
  */
 package io.pixelsdb.pixels.trino;
 
-import io.airlift.slice.Slice;
 import com.google.protobuf.ByteString;
+import io.airlift.log.Logger;
+import io.airlift.slice.Slice;
 import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.index.service.IndexService;
 import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
@@ -35,8 +36,22 @@ import static java.util.Objects.requireNonNull;
 /** Writes Trino UPDATE rows to the Pixels tag index without changing Pixels files. */
 final class PixelsMergeSink implements ConnectorMergeSink
 {
+    /**
+     * Bound the number of distinct tag values retained in one merge request.
+     * A 65,536-row request is about 1.6 MB for 8-byte primary keys, well below
+     * the configured 64 MB gRPC limit, and avoids turning a million-row
+     * distinct-tag fallback into roughly sixty small RPCs.
+     */
+    static final int MAX_PENDING_TAGS = 65_536;
+    private static final Logger logger = Logger.get(PixelsMergeSink.class);
     private final PixelsMergeTableHandle handle;
     private final TagIndex tagIndex;
+    private final Map<ByteBuffer, TagUpdateBuilder> pending = new LinkedHashMap<>();
+    private long pendingRows;
+    private long pendingPages;
+    private long encodingNanos;
+    private long rpcNanos;
+    private long rpcCount;
     private boolean closed;
 
     PixelsMergeSink(PixelsMergeTableHandle handle)
@@ -54,6 +69,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
     public void storeMergedRows(Page page)
     {
         requireNonNull(page, "page is null");
+        long encodingStart = System.nanoTime();
         List<PixelsColumnHandle> dataColumns = handle.getTableHandle().getColumns();
         if (page.getChannelCount() < dataColumns.size() + 3)
         {
@@ -70,7 +86,6 @@ final class PixelsMergeSink implements ConnectorMergeSink
         int rowIdChannel = dataColumns.size() + 2;
         Block operationBlock = page.getBlock(operationChannel);
         Block rowIdBlock = page.getBlock(rowIdChannel);
-        Map<ByteBuffer, TagUpdateBuilder> pending = new LinkedHashMap<>();
         for (int position = 0; position < page.getPositionCount(); position++)
         {
             if (operationBlock.isNull(position))
@@ -95,16 +110,25 @@ final class PixelsMergeSink implements ConnectorMergeSink
                 byte[] tag = encodeValue(updatedColumn, page.getBlock(dataIndex), position);
                 pending.computeIfAbsent(ByteBuffer.wrap(tag), ignored -> new TagUpdateBuilder(tag))
                         .primaryKeys.add(primaryKey);
+            if (pending.size() >= MAX_PENDING_TAGS)
+            {
+                flushPending();
+            }
             }
         }
-        tagIndex.appendBatch(handle.getTransactionTimestamp(), pending.values().stream()
-                .map(TagUpdateBuilder::build)
-                .toList());
+        pendingRows += page.getPositionCount();
+        pendingPages++;
+        encodingNanos += System.nanoTime() - encodingStart;
     }
 
     @Override
     public CompletableFuture<Collection<Slice>> finish()
     {
+        flushPending();
+        logger.info("[PIXELS_UPDATE_MERGE_METRIC] table=%s rows=%d pages=%d rpc_count=%d " +
+                        "encoding_ms=%.3f rpc_ms=%.3f",
+                handle.getTableHandle().getSchemaTableName(), pendingRows, pendingPages,
+                rpcCount, encodingNanos / 1_000_000.0, rpcNanos / 1_000_000.0);
         closeIndex();
         return CompletableFuture.completedFuture(List.of());
     }
@@ -112,6 +136,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
     @Override
     public void abort()
     {
+        pending.clear();
         closeIndex();
     }
 
@@ -122,6 +147,21 @@ final class PixelsMergeSink implements ConnectorMergeSink
             tagIndex.close();
             closed = true;
         }
+    }
+
+    private void flushPending()
+    {
+        if (pending.isEmpty())
+        {
+            return;
+        }
+        long rpcStart = System.nanoTime();
+        tagIndex.appendBatch(handle.getTransactionTimestamp(), pending.values().stream()
+                .map(TagUpdateBuilder::build)
+                .toList());
+        pending.clear();
+        rpcCount++;
+        rpcNanos += System.nanoTime() - rpcStart;
     }
 
     private static byte[] encodeValue(PixelsColumnHandle column, Block block, int position)

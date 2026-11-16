@@ -28,7 +28,10 @@ import static java.util.Objects.requireNonNull;
 /** Writes each completed INSERT batch to the primary and main indexes. */
 final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
 {
-    private static final int ROW_ID_BATCH_SIZE = 1024;
+    /** Reduce row-id allocation RPCs for large INSERT sinks. */
+    private static final int ROW_ID_BATCH_SIZE = 65_536;
+    /** Keep one INSERT index RPC bounded without returning to row-group-sized batches. */
+    static final int MAX_PENDING_ENTRIES_PER_BUCKET = 65_536;
 
     private final IndexService indexService;
     private final RowIdAllocator rowIdAllocator;
@@ -39,6 +42,7 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     private final List<TypeDescription> primaryKeyTypes;
     private final int[] primaryKeyOrdinals;
     private final ToIntFunction<ByteString> bucketIdResolver;
+    private final Map<Integer, List<IndexProto.PrimaryIndexEntry>> pendingEntriesByBucket = new HashMap<>();
     private final Map<Integer, List<IndexProto.IndexKey>> insertedKeysByBucket = new HashMap<>();
     private boolean hasEntries;
     private boolean finished;
@@ -83,7 +87,6 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     @Override
     public void appendBatch(VectorizedRowBatch batch, int rowGroupId, int firstRowOffset) throws IOException
     {
-        Map<Integer, List<IndexProto.PrimaryIndexEntry>> byBucket = new HashMap<>();
         try {
             for (int position = 0; position < batch.size; position++) {
                 ByteString key = ByteString.copyFrom(PrimaryKeyBytes.fromColumnVectors(
@@ -98,17 +101,15 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
                                 .setFileId(fileId).setRgId(rowGroupId)
                                 .setRgRowOffset(firstRowOffset + position))
                         .build();
-                byBucket.computeIfAbsent(bucket, ignored -> new ArrayList<>()).add(entry);
-            }
-            for (Map.Entry<Integer, List<IndexProto.PrimaryIndexEntry>> bucket : byBucket.entrySet()) {
-                IndexOption option = IndexOption.builder().vNodeId(bucket.getKey()).build();
-                if (!indexService.putPrimaryIndexEntries(tableId, indexId, bucket.getValue(), option)) {
-                    throw new IOException("failed to write Pixels INSERT primary index entries");
+                List<IndexProto.PrimaryIndexEntry> pendingEntries =
+                        pendingEntriesByBucket.computeIfAbsent(bucket, ignored -> new ArrayList<>());
+                pendingEntries.add(entry);
+                if (pendingEntries.size() >= MAX_PENDING_ENTRIES_PER_BUCKET)
+                {
+                    flushPendingBucket(bucket);
                 }
-                insertedKeysByBucket.computeIfAbsent(bucket.getKey(), ignored -> new ArrayList<>())
-                        .addAll(bucket.getValue().stream().map(IndexProto.PrimaryIndexEntry::getIndexKey).toList());
-                hasEntries = true;
             }
+            hasEntries = hasEntries || batch.size > 0;
         }
         catch (IndexException | RuntimeException e) {
             throw new IOException("failed to index Pixels INSERT rows", e);
@@ -122,6 +123,9 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
             return;
         }
         try {
+            for (Integer bucket : List.copyOf(pendingEntriesByBucket.keySet())) {
+                flushPendingBucket(bucket);
+            }
             if (!indexService.flushIndexEntriesOfFile(tableId, indexId, fileId, true, new IndexOption())) {
                 throw new IOException("failed to flush Pixels INSERT main index");
             }
@@ -130,6 +134,22 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
         catch (IndexException e) {
             throw new IOException("failed to flush Pixels INSERT main index", e);
         }
+    }
+
+    private void flushPendingBucket(int bucket) throws IOException, IndexException
+    {
+        List<IndexProto.PrimaryIndexEntry> entries = pendingEntriesByBucket.get(bucket);
+        if (entries == null || entries.isEmpty())
+        {
+            return;
+        }
+        IndexOption option = IndexOption.builder().vNodeId(bucket).build();
+        if (!indexService.putPrimaryIndexEntries(tableId, indexId, entries, option)) {
+            throw new IOException("failed to write Pixels INSERT primary index entries");
+        }
+        pendingEntriesByBucket.remove(bucket);
+        insertedKeysByBucket.computeIfAbsent(bucket, ignored -> new ArrayList<>())
+                .addAll(entries.stream().map(IndexProto.PrimaryIndexEntry::getIndexKey).toList());
     }
 
     @Override
@@ -161,6 +181,7 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
                 }
             }
             insertedKeysByBucket.clear();
+            pendingEntriesByBucket.clear();
             aborted = true;
         }
         catch (IndexException | RuntimeException e) {

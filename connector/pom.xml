@@ -24,6 +24,12 @@
             <artifactId>pixels-common</artifactId>
             <optional>true</optional>
         </dependency>
+        <!-- Keep the runtime protobuf implementation ahead of the fat Spike handler jar. -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <optional>true</optional>
+        </dependency>
         <dependency>
             <groupId>io.pixelsdb</groupId>
             <artifactId>pixels-cache</artifactId>
@@ -100,13 +106,6 @@
         <dependency>
             <groupId>io.trino</groupId>
             <artifactId>trino-plugin-toolkit</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- protobuf -->
-        <dependency>
-            <groupId>com.google.protobuf</groupId>
-            <artifactId>protobuf-java</artifactId>
             <optional>true</optional>
         </dependency>
 
