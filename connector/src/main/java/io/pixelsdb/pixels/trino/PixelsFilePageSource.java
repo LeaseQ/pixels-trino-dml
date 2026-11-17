@@ -406,6 +406,9 @@ class PixelsFilePageSource implements PixelsPageSource
                 }
             } catch (IOException e)
             {
+                logger.error(e, "Pixels file read failed: path=%s rgStart=%d rgLength=%d transId=%d transTimestamp=%d",
+                        split.getPath(), split.getRgStart(), split.getRgLength(),
+                        split.getTransId(), transactionHandle.getTimestamp());
                 closeWithSuppression(e);
                 throw new TrinoException(PixelsErrorCode.PIXELS_BAD_DATA, "read row batch error.", e);
             }
@@ -428,6 +431,9 @@ class PixelsFilePageSource implements PixelsPageSource
                 }
             } catch (IOException e)
             {
+                logger.error(e, "Pixels file prepare failed: path=%s rgStart=%d rgLength=%d transId=%d transTimestamp=%d",
+                        split.getPath(), split.getRgStart(), split.getRgLength(),
+                        split.getTransId(), transactionHandle.getTimestamp());
                 closeWithSuppression(e);
                 throw new TrinoException(PixelsErrorCode.PIXELS_BAD_DATA, "prepare row batch error.", e);
             }

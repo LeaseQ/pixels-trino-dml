@@ -24,6 +24,7 @@ import io.airlift.bootstrap.LifeCycleManager;
 import io.airlift.log.Logger;
 import io.pixelsdb.pixels.common.exception.QueryScheduleException;
 import io.pixelsdb.pixels.common.exception.TransException;
+import io.pixelsdb.pixels.common.metadata.MetadataCache;
 import io.pixelsdb.pixels.common.state.StateManager;
 import io.pixelsdb.pixels.common.transaction.QueryCost;
 import io.pixelsdb.pixels.common.transaction.QueryCostType;
@@ -111,7 +112,21 @@ public class PixelsConnector implements Connector
         TransContext context;
         try
         {
-            context = this.transService.beginTrans(true);
+            /*
+             * UPDATE publishes versioned tag-index entries.  A read-only
+             * transaction on an empty/fresh catalog legitimately receives
+             * snapshot timestamp 0, but IndexServer must reject that value
+             * for a write.  Trino does not reliably distinguish ordinary
+             * statements through the readOnly flag (see the comment below),
+             * so the connector must allocate a write timestamp here.  Reads
+             * still use the timestamp as their snapshot; the validation
+             * runtime commits the short-lived transaction normally.
+             */
+            context = this.transService.beginTrans(false);
+            // The common client only initializes these caches for transactions
+            // it starts as read-only.  Trino metadata planning still needs the
+            // same per-transaction caches for this write-timestamp path.
+            MetadataCache.Instance().initCache(context.getTransId());
         } catch (TransException e)
         {
             throw new TrinoException(PixelsErrorCode.PIXELS_TRANS_SERVICE_ERROR, e);
@@ -148,7 +163,7 @@ public class PixelsConnector implements Connector
 
         // readOnly in Trino is false if not explicitly set.
         // Do not use it to identify whether a transaction is an analytic query.
-        return new PixelsTransactionHandle(context.getTransId(), context.getTimestamp(), readOnly, executorType);
+        return new PixelsTransactionHandle(context.getTransId(), context.getTimestamp(), false, executorType);
     }
 
     @Override
@@ -164,6 +179,7 @@ public class PixelsConnector implements Connector
                 this.toDoBeforeTransTermination(handle);
                 // commit the transaction
                 this.transService.commitTrans(handle.getTransId(), handle.isReadOnly());
+                MetadataCache.Instance().dropCache(handle.getTransId());
             } catch (TransException e)
             {
                 throw new TrinoException(PixelsErrorCode.PIXELS_TRANS_SERVICE_ERROR, e);
@@ -201,6 +217,7 @@ public class PixelsConnector implements Connector
                 this.toDoBeforeTransTermination(handle);
                 // rollback the transaction
                 this.transService.rollbackTrans(handle.getTransId(), handle.isReadOnly());
+                MetadataCache.Instance().dropCache(handle.getTransId());
             } catch (TransException e)
             {
                 throw new TrinoException(PixelsErrorCode.PIXELS_TRANS_SERVICE_ERROR, e);

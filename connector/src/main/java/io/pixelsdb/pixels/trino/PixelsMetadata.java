@@ -30,6 +30,7 @@ import io.airlift.json.JsonCodec;
 import io.airlift.json.JsonCodecFactory;
 import io.airlift.json.ObjectMapperProvider;
 import io.airlift.log.Logger;
+import io.pixelsdb.pixels.common.exception.RetinaException;
 import io.pixelsdb.pixels.common.exception.MetadataException;
 import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.index.service.IndexService;
@@ -37,6 +38,7 @@ import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.metadata.domain.*;
 import io.pixelsdb.pixels.common.physical.Storage;
+import io.pixelsdb.pixels.common.retina.RetinaService;
 import io.pixelsdb.pixels.common.turbo.ExecutorType;
 import io.pixelsdb.pixels.core.PixelsProto;
 import io.pixelsdb.pixels.core.TypeDescription;
@@ -281,6 +283,12 @@ public class PixelsMetadata implements ConnectorMetadata
             PixelsTableHandle table = pixelsInsertTableHandle.getTableHandle();
             List<Layout> layouts = metadataProxy.getDataLayouts(table.getSchemaName(), table.getTableName());
             for (PixelsInsertFragment.Decoded decoded : completedFiles) {
+                // Trino may return an empty writer fragment for a split that
+                // received no rows.  Never publish its zero-byte placeholder
+                // as a readable REGULAR Pixels file.
+                if (decoded.numRowGroups() <= 0) {
+                    continue;
+                }
                 Path path = layouts.stream()
                         .flatMap(layout -> layout.getOrderedPaths().stream())
                         .filter(candidate -> candidate.getId() == decoded.pathId())
@@ -300,9 +308,13 @@ public class PixelsMetadata implements ConnectorMetadata
                 file.setType(File.Type.REGULAR);
                 file.setNumRowGroup(decoded.numRowGroups());
                 metadataProxy.getMetadataService().updateFile(file);
+                // INSERT writes the ordered file directly. Publish its row-group
+                // visibility so normal scans and subsequent UPDATEs can resolve
+                // the Retina bitmap.
+                RetinaService.Instance().addVisibility(File.getFilePath(path, file));
             }
         }
-        catch (MetadataException e) {
+        catch (MetadataException | RetinaException e) {
             throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
                     "failed to publish Pixels INSERT files for " +
                             pixelsInsertTableHandle.getTableHandle().getSchemaTableName(), e);
@@ -569,8 +581,8 @@ public class PixelsMetadata implements ConnectorMetadata
             logger.info("[PIXELS_UPDATE_METRIC] table=%s rows=%d metadata_ms=%.3f encoding_ms=%.3f " +
                             "request_build_ms=%.3f rpc_count=%d request_bytes=%d rpc_ms=%.3f total_ms=%.3f",
                     pixelsTableHandle.getSchemaTableName(), result.updatedRows(),
-                    nanosToMillis(metadataNanos), nanosToMillis(result.encodingNanos()), rpcCount[0],
-                    nanosToMillis(requestBuildNanos[0]), requestBytes[0],
+                    nanosToMillis(metadataNanos), nanosToMillis(result.encodingNanos()),
+                    nanosToMillis(requestBuildNanos[0]), rpcCount[0], requestBytes[0],
                     nanosToMillis(rpcNanos[0]), nanosToMillis(System.nanoTime() - totalStart));
             return OptionalLong.of(result.updatedRows());
         }
