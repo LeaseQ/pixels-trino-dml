@@ -46,7 +46,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
     private static final Logger logger = Logger.get(PixelsMergeSink.class);
     private final PixelsMergeTableHandle handle;
     private final TagIndex tagIndex;
-    private final Map<ByteBuffer, TagUpdateBuilder> pending = new LinkedHashMap<>();
+    private final Map<TagKey, TagUpdateBuilder> pending = new LinkedHashMap<>();
     private long pendingRows;
     private long pendingPages;
     private long encodingNanos;
@@ -108,12 +108,13 @@ final class PixelsMergeSink implements ConnectorMergeSink
                             "updated column is not present in the merge page: " + updatedColumn.getColumnName());
                 }
                 byte[] tag = encodeValue(updatedColumn, page.getBlock(dataIndex), position);
-                pending.computeIfAbsent(ByteBuffer.wrap(tag), ignored -> new TagUpdateBuilder(tag))
+                pending.computeIfAbsent(new TagKey(updatedColumn.getColumnName(), ByteBuffer.wrap(tag)),
+                                ignored -> new TagUpdateBuilder(updatedColumn.getColumnName(), tag))
                         .primaryKeys.add(primaryKey);
-            if (pending.size() >= MAX_PENDING_TAGS)
-            {
-                flushPending();
-            }
+                if (pending.size() >= MAX_PENDING_TAGS)
+                {
+                    flushPending();
+                }
             }
         }
         pendingRows += page.getPositionCount();
@@ -194,19 +195,23 @@ final class PixelsMergeSink implements ConnectorMergeSink
 
     private static final class TagUpdateBuilder
     {
+        private final String columnName;
         private final byte[] tag;
         private final List<byte[]> primaryKeys = new ArrayList<>();
 
-        private TagUpdateBuilder(byte[] tag)
+        private TagUpdateBuilder(String columnName, byte[] tag)
         {
+            this.columnName = columnName;
             this.tag = tag;
         }
 
         private TagUpdate build()
         {
-            return new TagUpdate(tag, List.copyOf(primaryKeys));
+            return new TagUpdate(columnName, tag, List.copyOf(primaryKeys));
         }
     }
+
+    private record TagKey(String columnName, ByteBuffer tag) {}
 
     interface TagIndex
     {
@@ -222,7 +227,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
         void close();
     }
 
-    record TagUpdate(byte[] tag, List<byte[]> primaryKeys) {}
+    record TagUpdate(String columnName, byte[] tag, List<byte[]> primaryKeys) {}
 
     private static final class RpcTagIndex implements TagIndex
     {
@@ -238,7 +243,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
         @Override
         public void append(byte[] tag, List<byte[]> primaryKeys)
         {
-            appendBatch(handle.getTransactionTimestamp(), List.of(new TagUpdate(tag, primaryKeys)));
+            appendBatch(handle.getTransactionTimestamp(), List.of(new TagUpdate("", tag, primaryKeys)));
         }
 
         @Override
@@ -248,6 +253,7 @@ final class PixelsMergeSink implements ConnectorMergeSink
             {
                 List<IndexProto.TagIndexUpdate> requests = updates.stream()
                         .map(update -> IndexProto.TagIndexUpdate.newBuilder()
+                                .setColumnName(update.columnName())
                                 .setTag(ByteString.copyFrom(update.tag()))
                                 .addAllPrimaryKeys(update.primaryKeys().stream()
                                         .map(ByteString::copyFrom).toList())

@@ -37,7 +37,7 @@ final class PixelsUpdateExecutor
         void append(List<TagUpdate> updates);
     }
 
-    record TagUpdate(byte[] tag, List<byte[]> primaryKeys) {}
+    record TagUpdate(String columnName, byte[] tag, List<byte[]> primaryKeys) {}
 
     record Result(long updatedRows, long encodingNanos) {}
 
@@ -84,7 +84,7 @@ final class PixelsUpdateExecutor
                             io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_DATA_TYPE_ERROR,
                             "UPDATE column is not present in the table handle: " + columnName));
             byte[] tag = encodeAssignment(column, assignment.getValue());
-            tagUpdates.add(new TagUpdate(tag, primaryKeys));
+            tagUpdates.add(new TagUpdate(columnName, tag, primaryKeys));
         }
         long encodingNanos = System.nanoTime() - encodingStart;
         tagIndex.append(tagUpdates);

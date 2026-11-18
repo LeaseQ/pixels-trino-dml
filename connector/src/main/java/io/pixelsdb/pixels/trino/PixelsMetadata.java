@@ -555,6 +555,7 @@ public class PixelsMetadata implements ConnectorMetadata
                     for (PixelsUpdateExecutor.TagUpdate update : updates) {
                         io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.Builder builder =
                                 io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
+                                        .setColumnName(update.columnName())
                                         .setTag(ByteString.copyFrom(update.tag()))
                                         .setTransactionTimestamp(transHandle.getTimestamp());
                         for (byte[] primaryKey : update.primaryKeys()) {

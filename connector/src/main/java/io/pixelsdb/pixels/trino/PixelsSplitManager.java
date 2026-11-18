@@ -1441,7 +1441,8 @@ public class PixelsSplitManager implements ConnectorSplitManager
 
             IndexService indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.rpc);
             List<byte[]> primaryKeys = indexService.getTagIndexEntries(
-                            table.getId(), primaryIndex.getId(), ByteString.copyFrom(tag), true).stream()
+                            table.getId(), primaryIndex.getId(), ByteString.copyFrom(tag), true,
+                            tagColumnName).stream()
                     .map(ByteString::toByteArray)
                     .toList();
             if (primaryKeys.isEmpty()) {
