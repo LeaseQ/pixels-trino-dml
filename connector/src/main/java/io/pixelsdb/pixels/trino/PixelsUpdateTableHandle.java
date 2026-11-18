@@ -10,7 +10,11 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.airlift.slice.Slice;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.expression.Constant;
+import io.trino.spi.type.DecimalType;
+import io.trino.spi.type.Int128;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -121,9 +125,31 @@ public final class PixelsUpdateTableHandle implements ConnectorTableHandle
             if (value instanceof Constant constant) {
                 value = constant.getValue();
             }
-            normalized.add(new PixelsUpdateAssignment(column, toSqlString(value)));
+            normalized.add(new PixelsUpdateAssignment(column, toSqlString(column, value)));
         }
         return normalized;
+    }
+
+    private static String toSqlString(PixelsColumnHandle column, Object value)
+    {
+        if (column.getColumnType() instanceof DecimalType decimalType)
+        {
+            BigInteger unscaled;
+            if (value instanceof Int128 int128)
+            {
+                unscaled = new BigInteger(int128.toBigEndianBytes());
+            }
+            else if (value instanceof Number number)
+            {
+                unscaled = BigInteger.valueOf(number.longValue());
+            }
+            else
+            {
+                return toSqlString(value);
+            }
+            return new BigDecimal(unscaled, decimalType.getScale()).toPlainString();
+        }
+        return toSqlString(value);
     }
 
     public static final class PixelsUpdateAssignment
