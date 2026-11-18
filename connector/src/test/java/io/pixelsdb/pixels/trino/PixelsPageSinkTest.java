@@ -88,6 +88,8 @@ class PixelsPageSinkTest
         PixelsInsertFragment.Decoded decoded = PixelsInsertFragment.decode(fragments.iterator().next());
         assertEquals(42L, decoded.pathId());
         assertEquals(1, decoded.numRowGroups());
+        assertEquals(0L, decoded.minRowId());
+        assertEquals(0L, decoded.maxRowId());
         assertEquals("writer_file.pxl", decoded.fileName());
     }
 

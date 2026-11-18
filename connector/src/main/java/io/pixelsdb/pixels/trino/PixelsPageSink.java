@@ -58,6 +58,16 @@ final class PixelsPageSink
         void finish() throws IOException;
 
         void abort() throws IOException;
+
+        default long getMinRowId()
+        {
+            return 0L;
+        }
+
+        default long getMaxRowId()
+        {
+            return 0L;
+        }
     }
 
     private final PixelsWriter writer;
@@ -186,7 +196,9 @@ final class PixelsPageSink
             finished = true;
             if (targetPathId >= 0 && fileName != null) {
                 return CompletableFuture.completedFuture(List.of(
-                        PixelsInsertFragment.encode(targetPathId, fileName, writer.getNumRowGroup())));
+                        PixelsInsertFragment.encode(targetPathId, fileName, writer.getNumRowGroup(),
+                                indexWriter == null ? 0L : indexWriter.getMinRowId(),
+                                indexWriter == null ? 0L : indexWriter.getMaxRowId())));
             }
             return CompletableFuture.completedFuture(List.of());
         }

@@ -307,6 +307,8 @@ public class PixelsMetadata implements ConnectorMetadata
                 }
                 file.setType(File.Type.REGULAR);
                 file.setNumRowGroup(decoded.numRowGroups());
+                file.setMinRowId(decoded.minRowId());
+                file.setMaxRowId(decoded.maxRowId());
                 metadataProxy.getMetadataService().updateFile(file);
                 // INSERT writes the ordered file directly. Publish its row-group
                 // visibility so normal scans and subsequent UPDATEs can resolve

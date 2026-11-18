@@ -71,6 +71,8 @@ class PixelsInsertIndexWriterTest
         assertArrayEquals(TypeDescription.fromString("long").convertSqlStringToByte("11"),
                 written.get(0).getIndexKey().getKey().toByteArray());
         assertEquals(List.of(99L), flushedFiles);
+        assertEquals(100L, index.getMinRowId());
+        assertEquals(101L, index.getMaxRowId());
     }
 
     @Test

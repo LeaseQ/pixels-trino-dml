@@ -44,6 +44,8 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     private final ToIntFunction<ByteString> bucketIdResolver;
     private final Map<Integer, List<IndexProto.PrimaryIndexEntry>> pendingEntriesByBucket = new HashMap<>();
     private final Map<Integer, List<IndexProto.IndexKey>> insertedKeysByBucket = new HashMap<>();
+    private long minRowId = Long.MAX_VALUE;
+    private long maxRowId = -1L;
     private boolean hasEntries;
     private boolean finished;
     private boolean aborted;
@@ -91,12 +93,15 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
             for (int position = 0; position < batch.size; position++) {
                 ByteString key = ByteString.copyFrom(PrimaryKeyBytes.fromColumnVectors(
                         primaryKeyTypes, batch.cols, primaryKeyOrdinals, position));
+                long rowId = rowIdAllocator.getRowId();
+                minRowId = Math.min(minRowId, rowId);
+                maxRowId = Math.max(maxRowId, rowId);
                 int bucket = bucketIdResolver.applyAsInt(key);
                 IndexProto.PrimaryIndexEntry entry = IndexProto.PrimaryIndexEntry.newBuilder()
                         .setIndexKey(IndexProto.IndexKey.newBuilder()
                                 .setTableId(tableId).setIndexId(indexId)
                                 .setKey(key).setTimestamp(timestamp))
-                        .setRowId(rowIdAllocator.getRowId())
+                        .setRowId(rowId)
                         .setRowLocation(IndexProto.RowLocation.newBuilder()
                                 .setFileId(fileId).setRgId(rowGroupId)
                                 .setRgRowOffset(firstRowOffset + position))
@@ -114,6 +119,18 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
         catch (IndexException | RuntimeException e) {
             throw new IOException("failed to index Pixels INSERT rows", e);
         }
+    }
+
+    @Override
+    public long getMinRowId()
+    {
+        return hasEntries ? minRowId : 0L;
+    }
+
+    @Override
+    public long getMaxRowId()
+    {
+        return hasEntries ? maxRowId : 0L;
     }
 
     @Override
