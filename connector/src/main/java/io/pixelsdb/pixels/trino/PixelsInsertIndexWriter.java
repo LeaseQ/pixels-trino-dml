@@ -6,6 +6,7 @@
 package io.pixelsdb.pixels.trino;
 
 import com.google.protobuf.ByteString;
+import io.airlift.log.Logger;
 import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.index.IndexOption;
 import io.pixelsdb.pixels.common.index.RowIdAllocator;
@@ -28,11 +29,12 @@ import static java.util.Objects.requireNonNull;
 /** Writes each completed INSERT batch to the primary and main indexes. */
 final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
 {
+    private static final Logger logger = Logger.get(PixelsInsertIndexWriter.class);
+
     /** Reduce row-id allocation RPCs for large INSERT sinks. */
     private static final int ROW_ID_BATCH_SIZE = 65_536;
     /** Keep one INSERT index RPC bounded without returning to row-group-sized batches. */
     static final int MAX_PENDING_ENTRIES_PER_BUCKET = 65_536;
-
     private final IndexService indexService;
     private final RowIdAllocator rowIdAllocator;
     private final long tableId;
@@ -46,6 +48,12 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     private final Map<Integer, List<IndexProto.IndexKey>> insertedKeysByBucket = new HashMap<>();
     private long minRowId = Long.MAX_VALUE;
     private long maxRowId = -1L;
+    private long appendNanos;
+    private long primaryPutNanos;
+    private long primaryPutWallNanos;
+    private long mainFlushNanos;
+    private int primaryRpcCount;
+    private long indexedRows;
     private boolean hasEntries;
     private boolean finished;
     private boolean aborted;
@@ -89,6 +97,7 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     @Override
     public void appendBatch(VectorizedRowBatch batch, int rowGroupId, int firstRowOffset) throws IOException
     {
+        long start = System.nanoTime();
         try {
             for (int position = 0; position < batch.size; position++) {
                 ByteString key = ByteString.copyFrom(PrimaryKeyBytes.fromColumnVectors(
@@ -115,9 +124,13 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
                 }
             }
             hasEntries = hasEntries || batch.size > 0;
+            indexedRows += batch.size;
         }
         catch (IndexException | RuntimeException e) {
             throw new IOException("failed to index Pixels INSERT rows", e);
+        }
+        finally {
+            appendNanos += System.nanoTime() - start;
         }
     }
 
@@ -140,13 +153,25 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
             return;
         }
         try {
+            long primaryStart = System.nanoTime();
             for (Integer bucket : List.copyOf(pendingEntriesByBucket.keySet())) {
                 flushPendingBucket(bucket);
             }
+            primaryPutWallNanos += System.nanoTime() - primaryStart;
+            long flushStart = System.nanoTime();
             if (!indexService.flushIndexEntriesOfFile(tableId, indexId, fileId, true, new IndexOption())) {
                 throw new IOException("failed to flush Pixels INSERT main index");
             }
+            mainFlushNanos += System.nanoTime() - flushStart;
             finished = true;
+            logger.info("[PIXELS_INSERT_INDEX_METRIC] file_id=%s rows=%s primary_rpc_count=%s append_ms=%.3f primary_put_ms=%.3f primary_put_wall_ms=%.3f main_flush_ms=%.3f",
+                    fileId,
+                    indexedRows,
+                    primaryRpcCount,
+                    appendNanos / 1_000_000.0,
+                    primaryPutNanos / 1_000_000.0,
+                    primaryPutWallNanos / 1_000_000.0,
+                    mainFlushNanos / 1_000_000.0);
         }
         catch (IndexException e) {
             throw new IOException("failed to flush Pixels INSERT main index", e);
@@ -161,9 +186,12 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
             return;
         }
         IndexOption option = IndexOption.builder().vNodeId(bucket).build();
+        long start = System.nanoTime();
         if (!indexService.putPrimaryIndexEntries(tableId, indexId, entries, option)) {
             throw new IOException("failed to write Pixels INSERT primary index entries");
         }
+        primaryPutNanos += System.nanoTime() - start;
+        primaryRpcCount++;
         pendingEntriesByBucket.remove(bucket);
         insertedKeysByBucket.computeIfAbsent(bucket, ignored -> new ArrayList<>())
                 .addAll(entries.stream().map(IndexProto.PrimaryIndexEntry::getIndexKey).toList());

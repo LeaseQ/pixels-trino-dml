@@ -5,6 +5,7 @@
  */
 package io.pixelsdb.pixels.trino;
 
+import io.airlift.log.Logger;
 import io.airlift.slice.Slice;
 import io.pixelsdb.pixels.core.PixelsWriter;
 import io.pixelsdb.pixels.core.TypeDescription;
@@ -51,6 +52,8 @@ import static java.util.Objects.requireNonNull;
 final class PixelsPageSink
         implements ConnectorPageSink
 {
+    private static final Logger logger = Logger.get(PixelsPageSink.class);
+
     interface InsertIndexWriter
     {
         void appendBatch(VectorizedRowBatch batch, int rowGroupId, int firstRowOffset) throws IOException;
@@ -79,6 +82,10 @@ final class PixelsPageSink
     private final InsertIndexWriter indexWriter;
     private final Runnable abortCleanup;
     private int currentRowGroupOffset;
+    private long writtenRows;
+    private long flushCount;
+    private long writeNanos;
+    private long indexNanos;
     private boolean finished;
     private boolean aborted;
 
@@ -194,6 +201,11 @@ final class PixelsPageSink
                 indexWriter.finish();
             }
             finished = true;
+            logger.info("[PIXELS_INSERT_SINK_METRIC] rows=%s flush_count=%s write_ms=%.3f index_ms=%.3f",
+                    writtenRows,
+                    flushCount,
+                    writeNanos / 1_000_000.0,
+                    indexNanos / 1_000_000.0);
             if (targetPathId >= 0 && fileName != null) {
                 return CompletableFuture.completedFuture(List.of(
                         PixelsInsertFragment.encode(targetPathId, fileName, writer.getNumRowGroup(),
@@ -264,10 +276,16 @@ final class PixelsPageSink
         }
         int rowGroupId = writer.getNumRowGroup();
         int batchSize = rowBatch.size;
+        long writeStart = System.nanoTime();
         writer.addRowBatch(rowBatch);
+        writeNanos += System.nanoTime() - writeStart;
         if (indexWriter != null) {
+            long indexStart = System.nanoTime();
             indexWriter.appendBatch(rowBatch, rowGroupId, currentRowGroupOffset);
+            indexNanos += System.nanoTime() - indexStart;
         }
+        writtenRows += batchSize;
+        flushCount++;
         currentRowGroupOffset = writer.getNumRowGroup() > rowGroupId
                 ? 0
                 : currentRowGroupOffset + batchSize;
