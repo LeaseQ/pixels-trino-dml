@@ -184,6 +184,7 @@ class PixelsUpdateExecutorTest
 
         assertEquals(1L, PixelsUpdateExecutor.execute(update, primaryIndex(), index));
         assertEquals(1, index.batchCount);
+        assertEquals(1, index.sharedBatchCount);
         assertEquals(2, index.entries.size());
     }
 
@@ -235,12 +236,20 @@ class PixelsUpdateExecutorTest
     {
         private final List<Entry> entries = new ArrayList<>();
         private int batchCount;
+        private int sharedBatchCount;
 
         @Override
         public void append(List<PixelsUpdateExecutor.TagUpdate> updates)
         {
             batchCount++;
             updates.forEach(update -> entries.add(new Entry(update.tag(), update.primaryKeys())));
+        }
+
+        @Override
+        public void appendShared(List<PixelsUpdateExecutor.TagUpdate> updates)
+        {
+            sharedBatchCount++;
+            append(updates);
         }
 
         private record Entry(byte[] tag, List<byte[]> primaryKeys) {}

@@ -94,8 +94,10 @@ class PixelsUpdateRequestMillionRowProbeTest
             assertEquals(rows, result.updatedRows());
             assertEquals(1, index.batchCount);
             System.out.printf("[PIXELS_UPDATE_REQUEST_WIDTH_PROBE] rows=%d assignments=%d " +
-                            "request_bytes=%d build_ms=%.3f%n",
-                    rows, assignmentCount, index.requestBytes, index.buildNanos / 1_000_000.0);
+                            "shared_request_bytes=%d regular_request_bytes=%d reduction=%.2fx build_ms=%.3f%n",
+                    rows, assignmentCount, index.requestBytes, index.regularRequestBytes,
+                    (double) index.regularRequestBytes / index.requestBytes,
+                    index.buildNanos / 1_000_000.0);
         }
     }
 
@@ -123,16 +125,54 @@ class PixelsUpdateRequestMillionRowProbeTest
     {
         private int batchCount;
         private long buildNanos;
-        private int requestBytes;
+        private long requestBytes;
+        private long regularRequestBytes;
 
         @Override
         public void append(List<PixelsUpdateExecutor.TagUpdate> updates)
         {
+            regularRequestBytes += buildRegularRequest(updates).getSerializedSize();
+            batchCount++;
+        }
+
+        @Override
+        public void appendShared(List<PixelsUpdateExecutor.TagUpdate> updates)
+        {
             long start = System.nanoTime();
+            PixelsUpdateExecutor.TagUpdate first = updates.get(0);
+            List<IndexProto.SharedTagIndexValue> values = updates.stream()
+                    .map(update -> IndexProto.SharedTagIndexValue.newBuilder()
+                            .setColumnName(update.columnName())
+                            .setTag(ByteString.copyFrom(update.tag()))
+                            .build())
+                    .toList();
+            IndexProto.SharedTagIndexUpdate sharedUpdate =
+                    IndexProto.SharedTagIndexUpdate.newBuilder()
+                            .setTransactionTimestamp(1L)
+                            .addAllPrimaryKeys(first.primaryKeys().stream()
+                                    .map(ByteString::copyFrom).toList())
+                            .addAllValues(values)
+                            .build();
+            IndexProto.AppendSharedTagIndexEntriesRequest sharedRequest =
+                    IndexProto.AppendSharedTagIndexEntriesRequest.newBuilder()
+                            .setTableId(22L)
+                            .setIndexId(11L)
+                            .addUpdates(sharedUpdate)
+                            .build();
+            requestBytes += sharedRequest.getSerializedSize();
+            regularRequestBytes += buildRegularRequest(updates).getSerializedSize();
+            buildNanos += System.nanoTime() - start;
+            batchCount++;
+        }
+
+        private static IndexProto.AppendTagIndexEntriesRequest buildRegularRequest(
+                List<PixelsUpdateExecutor.TagUpdate> updates)
+        {
             List<IndexProto.TagIndexUpdate> requests = new ArrayList<>(updates.size());
             for (PixelsUpdateExecutor.TagUpdate update : updates)
             {
                 IndexProto.TagIndexUpdate.Builder builder = IndexProto.TagIndexUpdate.newBuilder()
+                        .setColumnName(update.columnName())
                         .setTag(ByteString.copyFrom(update.tag()))
                         .setTransactionTimestamp(1L);
                 for (byte[] primaryKey : update.primaryKeys())
@@ -141,15 +181,11 @@ class PixelsUpdateRequestMillionRowProbeTest
                 }
                 requests.add(builder.build());
             }
-            IndexProto.AppendTagIndexEntriesRequest request =
-                    IndexProto.AppendTagIndexEntriesRequest.newBuilder()
-                            .setTableId(22L)
-                            .setIndexId(11L)
-                            .addAllUpdates(requests)
-                            .build();
-            requestBytes += request.getSerializedSize();
-            buildNanos += System.nanoTime() - start;
-            batchCount++;
+            return IndexProto.AppendTagIndexEntriesRequest.newBuilder()
+                    .setTableId(22L)
+                    .setIndexId(11L)
+                    .addAllUpdates(requests)
+                    .build();
         }
     }
 }

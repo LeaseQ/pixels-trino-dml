@@ -546,44 +546,107 @@ public class PixelsMetadata implements ConnectorMetadata
             final long[] rpcCount = {0L};
             final long[] requestBytes = {0L};
             final long[] requestBuildNanos = {0L};
+            final String[] requestMode = {"shared"};
             PixelsUpdateExecutor.Result result = PixelsUpdateExecutor.executeWithMetrics(
-                    updateHandle, resolvedPrimaryKeyColumns, updates -> {
-                long requestStart = System.nanoTime();
-                try {
-                    List<io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate> requests =
-                            new ArrayList<>(updates.size());
-                    for (PixelsUpdateExecutor.TagUpdate update : updates) {
-                        io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.Builder builder =
-                                io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
-                                        .setColumnName(update.columnName())
-                                        .setTag(ByteString.copyFrom(update.tag()))
-                                        .setTransactionTimestamp(transHandle.getTimestamp());
-                        for (byte[] primaryKey : update.primaryKeys()) {
-                            builder.addPrimaryKeys(ByteString.copyFrom(primaryKey));
+                    updateHandle, resolvedPrimaryKeyColumns, new PixelsUpdateExecutor.TagIndex()
+                    {
+                        @Override
+                        public void append(List<PixelsUpdateExecutor.TagUpdate> updates)
+                        {
+                            requestMode[0] = "regular";
+                            appendRegular(updates);
                         }
-                        requests.add(builder.build());
-                    }
-                    io.pixelsdb.pixels.index.IndexProto.AppendTagIndexEntriesRequest request =
-                            io.pixelsdb.pixels.index.IndexProto.AppendTagIndexEntriesRequest.newBuilder()
-                                    .setTableId(resolvedTableId)
-                                    .setIndexId(resolvedIndexId)
-                                    .addAllUpdates(requests)
-                                    .build();
-                    requestBytes[0] += request.getSerializedSize();
-                    requestBuildNanos[0] += System.nanoTime() - requestStart;
-                    long rpcStart = System.nanoTime();
-                    rpcCount[0]++;
-                    indexService.appendTagIndexEntries(resolvedTableId, resolvedIndexId, requests);
-                    rpcNanos[0] += System.nanoTime() - rpcStart;
-                }
-                catch (IndexException e) {
-                    throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
-                            "failed to append Pixels UPDATE tag index through IndexServer", e);
-                }
-            });
-            logger.info("[PIXELS_UPDATE_METRIC] table=%s rows=%d metadata_ms=%.3f encoding_ms=%.3f " +
+
+                        @Override
+                        public void appendShared(List<PixelsUpdateExecutor.TagUpdate> updates)
+                        {
+                            if (updates.isEmpty()) {
+                                return;
+                            }
+                            List<byte[]> primaryKeys = updates.get(0).primaryKeys();
+                            if (updates.stream().anyMatch(update -> update.primaryKeys() != primaryKeys)) {
+                                append(updates);
+                                return;
+                            }
+                            long requestStart = System.nanoTime();
+                            try {
+                                List<io.pixelsdb.pixels.index.IndexProto.SharedTagIndexValue> values =
+                                        updates.stream()
+                                                .map(update -> io.pixelsdb.pixels.index.IndexProto.SharedTagIndexValue
+                                                        .newBuilder()
+                                                        .setColumnName(update.columnName())
+                                                        .setTag(ByteString.copyFrom(update.tag()))
+                                                        .build())
+                                                .toList();
+                                io.pixelsdb.pixels.index.IndexProto.SharedTagIndexUpdate sharedUpdate =
+                                        io.pixelsdb.pixels.index.IndexProto.SharedTagIndexUpdate.newBuilder()
+                                                .setTransactionTimestamp(transHandle.getTimestamp())
+                                                .addAllPrimaryKeys(primaryKeys.stream()
+                                                        .map(ByteString::copyFrom).toList())
+                                                .addAllValues(values)
+                                                .build();
+                                io.pixelsdb.pixels.index.IndexProto.AppendSharedTagIndexEntriesRequest request =
+                                        io.pixelsdb.pixels.index.IndexProto.AppendSharedTagIndexEntriesRequest
+                                                .newBuilder()
+                                                .setTableId(resolvedTableId)
+                                                .setIndexId(resolvedIndexId)
+                                                .addUpdates(sharedUpdate)
+                                                .build();
+                                requestBytes[0] += request.getSerializedSize();
+                                requestBuildNanos[0] += System.nanoTime() - requestStart;
+                                long rpcStart = System.nanoTime();
+                                rpcCount[0]++;
+                                indexService.appendSharedTagIndexEntries(
+                                        resolvedTableId, resolvedIndexId, List.of(sharedUpdate));
+                                rpcNanos[0] += System.nanoTime() - rpcStart;
+                            }
+                            catch (IndexException e) {
+                                throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                                        "failed to append shared Pixels UPDATE tag index through IndexServer", e);
+                            }
+                        }
+
+                        private void appendRegular(List<PixelsUpdateExecutor.TagUpdate> updates)
+                        {
+                            long requestStart = System.nanoTime();
+                            try {
+                                List<io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate> requests =
+                                        new ArrayList<>(updates.size());
+                                for (PixelsUpdateExecutor.TagUpdate update : updates) {
+                                    io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.Builder builder =
+                                            io.pixelsdb.pixels.index.IndexProto.TagIndexUpdate.newBuilder()
+                                                    .setColumnName(update.columnName())
+                                                    .setTag(ByteString.copyFrom(update.tag()))
+                                                    .setTransactionTimestamp(transHandle.getTimestamp());
+                                    for (byte[] primaryKey : update.primaryKeys()) {
+                                        builder.addPrimaryKeys(ByteString.copyFrom(primaryKey));
+                                    }
+                                    requests.add(builder.build());
+                                }
+                                io.pixelsdb.pixels.index.IndexProto.AppendTagIndexEntriesRequest request =
+                                        io.pixelsdb.pixels.index.IndexProto.AppendTagIndexEntriesRequest.newBuilder()
+                                                .setTableId(resolvedTableId)
+                                                .setIndexId(resolvedIndexId)
+                                                .addAllUpdates(requests)
+                                                .build();
+                                requestBytes[0] += request.getSerializedSize();
+                                requestBuildNanos[0] += System.nanoTime() - requestStart;
+                                long rpcStart = System.nanoTime();
+                                rpcCount[0]++;
+                                indexService.appendTagIndexEntries(
+                                        resolvedTableId, resolvedIndexId, requests);
+                                rpcNanos[0] += System.nanoTime() - rpcStart;
+                            }
+                            catch (IndexException e) {
+                                throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                                        "failed to append Pixels UPDATE tag index through IndexServer", e);
+                            }
+                        }
+                    });
+            logger.info("[PIXELS_UPDATE_METRIC] table=%s rows=%d mode=%s metadata_ms=%.3f encoding_ms=%.3f " +
                             "request_build_ms=%.3f rpc_count=%d request_bytes=%d rpc_ms=%.3f total_ms=%.3f",
                     pixelsTableHandle.getSchemaTableName(), result.updatedRows(),
+                    requestMode[0],
                     nanosToMillis(metadataNanos), nanosToMillis(result.encodingNanos()),
                     nanosToMillis(requestBuildNanos[0]), rpcCount[0], requestBytes[0],
                     nanosToMillis(rpcNanos[0]), nanosToMillis(System.nanoTime() - totalStart));

@@ -35,6 +35,17 @@ final class PixelsUpdateExecutor
     interface TagIndex
     {
         void append(List<TagUpdate> updates);
+
+        /**
+         * Exact UPDATEs reuse one primary-key vector across assignments. The
+         * default keeps non-RPC implementations and old test doubles correct;
+         * the connector RPC implementation overrides it with the shared-key
+         * request.
+         */
+        default void appendShared(List<TagUpdate> updates)
+        {
+            append(updates);
+        }
     }
 
     record TagUpdate(String columnName, byte[] tag, List<byte[]> primaryKeys) {}
@@ -87,7 +98,7 @@ final class PixelsUpdateExecutor
             tagUpdates.add(new TagUpdate(columnName, tag, primaryKeys));
         }
         long encodingNanos = System.nanoTime() - encodingStart;
-        tagIndex.append(tagUpdates);
+        tagIndex.appendShared(tagUpdates);
         return new Result(primaryKeys.size(), encodingNanos);
     }
 
