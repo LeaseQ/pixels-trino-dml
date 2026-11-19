@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -64,6 +65,38 @@ class PixelsUpdateRequestMillionRowProbeTest
                         "protobuf_build_ms=%.3f request_bytes=%d%n",
                 rows, elapsedMs, result.encodingNanos() / 1_000_000.0,
                 index.buildNanos / 1_000_000.0, index.requestBytes);
+    }
+
+    @Test
+    void measuresRepeatedPrimaryKeyEncodingAcrossAssignments()
+    {
+        int rows = Integer.getInteger("pixels.update.request.probe.rows", 100_000);
+        long[] primaryKeyCounts = new long[] {1, 2, 4, 8};
+        for (long assignmentCount : primaryKeyCounts)
+        {
+            PixelsColumnHandle id = column("id", BigintType.BIGINT, LONG, 0);
+            List<PixelsColumnHandle> columns = new ArrayList<>();
+            columns.add(id);
+            Map<PixelsColumnHandle, Constant> assignments = new LinkedHashMap<>();
+            for (int ordinal = 1; ordinal <= assignmentCount; ordinal++)
+            {
+                PixelsColumnHandle label = column("label_" + ordinal, VarcharType.VARCHAR, STRING, ordinal);
+                columns.add(label);
+                assignments.put(label, new Constant("vip" + ordinal, VarcharType.VARCHAR));
+            }
+            Domain keys = Domain.create(ValueSet.ofRanges(
+                    Range.range(BigintType.BIGINT, 0L, true, rows - 1L, true)), false);
+            PixelsUpdateTableHandle update = new PixelsUpdateTableHandle(
+                    tableHandle(columns, TupleDomain.withColumnDomains(Map.of(id, keys))), assignments);
+            ProtobufTagIndex index = new ProtobufTagIndex();
+            PixelsUpdateExecutor.Result result = PixelsUpdateExecutor.executeWithMetrics(
+                    update, List.of(id), index);
+            assertEquals(rows, result.updatedRows());
+            assertEquals(1, index.batchCount);
+            System.out.printf("[PIXELS_UPDATE_REQUEST_WIDTH_PROBE] rows=%d assignments=%d " +
+                            "request_bytes=%d build_ms=%.3f%n",
+                    rows, assignmentCount, index.requestBytes, index.buildNanos / 1_000_000.0);
+        }
     }
 
     private static PixelsTableHandle tableHandle(
