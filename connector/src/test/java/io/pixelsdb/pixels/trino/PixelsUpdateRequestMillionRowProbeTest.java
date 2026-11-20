@@ -149,6 +149,7 @@ class PixelsUpdateRequestMillionRowProbeTest
             IndexProto.SharedTagIndexUpdate sharedUpdate =
                     IndexProto.SharedTagIndexUpdate.newBuilder()
                             .setTransactionTimestamp(1L)
+                            .setPrimaryKeysAreUnique(true)
                             .addAllPrimaryKeys(first.primaryKeys().stream()
                                     .map(ByteString::copyFrom).toList())
                             .addAllValues(values)

@@ -581,6 +581,9 @@ public class PixelsMetadata implements ConnectorMetadata
                                 io.pixelsdb.pixels.index.IndexProto.SharedTagIndexUpdate sharedUpdate =
                                         io.pixelsdb.pixels.index.IndexProto.SharedTagIndexUpdate.newBuilder()
                                                 .setTransactionTimestamp(transHandle.getTimestamp())
+                                                // Exact UPDATE resolves a unique primary-key row vector;
+                                                // let the server reuse it across changed columns.
+                                                .setPrimaryKeysAreUnique(true)
                                                 .addAllPrimaryKeys(primaryKeys.stream()
                                                         .map(ByteString::copyFrom).toList())
                                                 .addAllValues(values)
