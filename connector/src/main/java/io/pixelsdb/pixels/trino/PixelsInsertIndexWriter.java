@@ -22,6 +22,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.function.ToIntFunction;
 
 import static java.util.Objects.requireNonNull;
@@ -35,6 +39,9 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     private static final int ROW_ID_BATCH_SIZE = 65_536;
     /** Keep one INSERT index RPC bounded without returning to row-group-sized batches. */
     static final int MAX_PENDING_ENTRIES_PER_BUCKET = 65_536;
+    /** Experimental opt-in parallelism for independent vnode primary-index RPCs. */
+    static final String PRIMARY_FLUSH_PARALLELISM_PROPERTY =
+            "pixels.insert.index.flush.parallelism";
     private final IndexService indexService;
     private final RowIdAllocator rowIdAllocator;
     private final long tableId;
@@ -55,6 +62,7 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     private int primaryRpcCount;
     private long indexedRows;
     private boolean hasEntries;
+    private boolean hadStagedBucketFlush;
     private boolean finished;
     private boolean aborted;
 
@@ -120,6 +128,7 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
                 pendingEntries.add(entry);
                 if (pendingEntries.size() >= MAX_PENDING_ENTRIES_PER_BUCKET)
                 {
+                    hadStagedBucketFlush = true;
                     flushPendingBucket(bucket);
                 }
             }
@@ -154,9 +163,7 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
         }
         try {
             long primaryStart = System.nanoTime();
-            for (Integer bucket : List.copyOf(pendingEntriesByBucket.keySet())) {
-                flushPendingBucket(bucket);
-            }
+            flushPendingBuckets();
             primaryPutWallNanos += System.nanoTime() - primaryStart;
             long flushStart = System.nanoTime();
             if (!indexService.flushIndexEntriesOfFile(tableId, indexId, fileId, true, new IndexOption())) {
@@ -164,10 +171,11 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
             }
             mainFlushNanos += System.nanoTime() - flushStart;
             finished = true;
-            logger.info("[PIXELS_INSERT_INDEX_METRIC] file_id=%s rows=%s primary_rpc_count=%s append_ms=%.3f primary_put_ms=%.3f primary_put_wall_ms=%.3f main_flush_ms=%.3f",
+            logger.info("[PIXELS_INSERT_INDEX_METRIC] file_id=%s rows=%s primary_rpc_count=%s primary_flush_parallelism=%s append_ms=%.3f primary_put_ms=%.3f primary_put_wall_ms=%.3f main_flush_ms=%.3f",
                     fileId,
                     indexedRows,
                     primaryRpcCount,
+                    effectivePrimaryFlushParallelism(),
                     appendNanos / 1_000_000.0,
                     primaryPutNanos / 1_000_000.0,
                     primaryPutWallNanos / 1_000_000.0,
@@ -178,6 +186,83 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
         }
     }
 
+    private void flushPendingBuckets() throws IOException, IndexException
+    {
+        List<Integer> buckets = List.copyOf(pendingEntriesByBucket.keySet());
+        if (buckets.isEmpty()) {
+            return;
+        }
+        // A large INSERT may have already flushed the first batch of a bucket
+        // while appendBatch was still producing rows. Keep later batches
+        // serialized until mixed serial/parallel writes prove fully visible.
+        int parallelism = hadStagedBucketFlush
+                ? 1
+                : Math.min(configuredPrimaryFlushParallelism(), buckets.size());
+        if (parallelism <= 1) {
+            for (Integer bucket : buckets) {
+                flushPendingBucket(bucket);
+            }
+            return;
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(parallelism);
+        List<Future<BucketWriteResult>> futures = new ArrayList<>(buckets.size());
+        try {
+            for (Integer bucket : buckets) {
+                List<IndexProto.PrimaryIndexEntry> entries = List.copyOf(pendingEntriesByBucket.get(bucket));
+                futures.add(executor.submit(() -> writePendingBucket(bucket, entries)));
+            }
+
+            List<BucketWriteResult> results = new ArrayList<>(futures.size());
+            IOException failure = null;
+            for (Future<BucketWriteResult> future : futures) {
+                try {
+                    results.add(future.get());
+                }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    failure = new IOException("interrupted while flushing Pixels INSERT primary index entries", e);
+                }
+                catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof IOException) {
+                        failure = (IOException) cause;
+                    }
+                    else if (cause instanceof IndexException) {
+                        failure = new IOException("failed to flush Pixels INSERT primary index entries", cause);
+                    }
+                    else if (cause instanceof RuntimeException) {
+                        failure = new IOException("failed to flush Pixels INSERT primary index entries", cause);
+                    }
+                    else {
+                        failure = new IOException("failed to flush Pixels INSERT primary index entries", cause);
+                    }
+                }
+            }
+            // Record every completed write before propagating a peer failure so abort()
+            // can remove entries that were already accepted by the index service.
+            for (BucketWriteResult result : results) {
+                recordCompletedBucket(result);
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+        finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private int configuredPrimaryFlushParallelism()
+    {
+        return Math.max(1, Integer.getInteger(PRIMARY_FLUSH_PARALLELISM_PROPERTY, 1));
+    }
+
+    private int effectivePrimaryFlushParallelism()
+    {
+        return hadStagedBucketFlush ? 1 : configuredPrimaryFlushParallelism();
+    }
+
     private void flushPendingBucket(int bucket) throws IOException, IndexException
     {
         List<IndexProto.PrimaryIndexEntry> entries = pendingEntriesByBucket.get(bucket);
@@ -185,16 +270,43 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
         {
             return;
         }
+        recordCompletedBucket(writePendingBucket(bucket, entries));
+    }
+
+    private BucketWriteResult writePendingBucket(int bucket,
+            List<IndexProto.PrimaryIndexEntry> entries) throws IOException, IndexException
+    {
         IndexOption option = IndexOption.builder().vNodeId(bucket).build();
         long start = System.nanoTime();
         if (!indexService.putPrimaryIndexEntries(tableId, indexId, entries, option)) {
             throw new IOException("failed to write Pixels INSERT primary index entries");
         }
-        primaryPutNanos += System.nanoTime() - start;
+        return new BucketWriteResult(bucket, entries, System.nanoTime() - start);
+    }
+
+    private void recordCompletedBucket(BucketWriteResult result)
+    {
+        primaryPutNanos += result.elapsedNanos;
         primaryRpcCount++;
+        int bucket = result.bucket;
+        List<IndexProto.PrimaryIndexEntry> entries = result.entries;
         pendingEntriesByBucket.remove(bucket);
         insertedKeysByBucket.computeIfAbsent(bucket, ignored -> new ArrayList<>())
                 .addAll(entries.stream().map(IndexProto.PrimaryIndexEntry::getIndexKey).toList());
+    }
+
+    private static final class BucketWriteResult
+    {
+        private final int bucket;
+        private final List<IndexProto.PrimaryIndexEntry> entries;
+        private final long elapsedNanos;
+
+        private BucketWriteResult(int bucket, List<IndexProto.PrimaryIndexEntry> entries, long elapsedNanos)
+        {
+            this.bucket = bucket;
+            this.entries = entries;
+            this.elapsedNanos = elapsedNanos;
+        }
     }
 
     @Override

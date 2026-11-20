@@ -178,7 +178,10 @@ public class PixelsConnector implements Connector
                 
                 this.toDoBeforeTransTermination(handle);
                 // commit the transaction
+                long commitStart = System.nanoTime();
                 this.transService.commitTrans(handle.getTransId(), handle.isReadOnly());
+                logger.info("[PIXELS_INSERT_COMMIT_METRIC] trans_id=%s commit_ms=%.3f",
+                        handle.getTransId(), (System.nanoTime() - commitStart) / 1_000_000.0);
                 MetadataCache.Instance().dropCache(handle.getTransId());
             } catch (TransException e)
             {

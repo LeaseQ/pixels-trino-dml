@@ -280,8 +280,14 @@ public class PixelsMetadata implements ConnectorMetadata
             return Optional.empty();
         }
         try {
+            long publishStart = System.nanoTime();
+            long layoutStart = System.nanoTime();
             PixelsTableHandle table = pixelsInsertTableHandle.getTableHandle();
             List<Layout> layouts = metadataProxy.getDataLayouts(table.getSchemaName(), table.getTableName());
+            long layoutNanos = System.nanoTime() - layoutStart;
+            long metadataLookupNanos = 0L;
+            long metadataUpdateNanos = 0L;
+            long retinaNanos = 0L;
             for (PixelsInsertFragment.Decoded decoded : completedFiles) {
                 // Trino may return an empty writer fragment for a split that
                 // received no rows.  Never publish its zero-byte placeholder
@@ -298,8 +304,10 @@ public class PixelsMetadata implements ConnectorMetadata
                 String fullPath = path.getUri().endsWith("/")
                         ? path.getUri() + decoded.fileName()
                         : path.getUri() + "/" + decoded.fileName();
+                long metadataLookupStart = System.nanoTime();
                 long fileId = metadataProxy.getMetadataService().getFileId(fullPath);
                 File file = metadataProxy.getMetadataService().getFileById(fileId);
+                metadataLookupNanos += System.nanoTime() - metadataLookupStart;
                 if (file == null || file.getType() != File.Type.TEMPORARY_INGEST ||
                         file.getPathId() != decoded.pathId() || !decoded.fileName().equals(file.getName())) {
                     throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,
@@ -309,12 +317,24 @@ public class PixelsMetadata implements ConnectorMetadata
                 file.setNumRowGroup(decoded.numRowGroups());
                 file.setMinRowId(decoded.minRowId());
                 file.setMaxRowId(decoded.maxRowId());
+                long metadataUpdateStart = System.nanoTime();
                 metadataProxy.getMetadataService().updateFile(file);
+                metadataUpdateNanos += System.nanoTime() - metadataUpdateStart;
                 // INSERT writes the ordered file directly. Publish its row-group
                 // visibility so normal scans and subsequent UPDATEs can resolve
                 // the Retina bitmap.
+                long retinaStart = System.nanoTime();
                 RetinaService.Instance().addVisibility(File.getFilePath(path, file));
+                retinaNanos += System.nanoTime() - retinaStart;
             }
+            logger.info("[PIXELS_INSERT_PUBLISH_METRIC] table=%s fragments=%s layout_ms=%.3f metadata_lookup_ms=%.3f metadata_update_ms=%.3f retina_ms=%.3f total_ms=%.3f",
+                    table.getSchemaTableName(),
+                    completedFiles.size(),
+                    layoutNanos / 1_000_000.0,
+                    metadataLookupNanos / 1_000_000.0,
+                    metadataUpdateNanos / 1_000_000.0,
+                    retinaNanos / 1_000_000.0,
+                    (System.nanoTime() - publishStart) / 1_000_000.0);
         }
         catch (MetadataException | RetinaException e) {
             throw new TrinoException(PixelsErrorCode.PIXELS_METADATA_ERROR,

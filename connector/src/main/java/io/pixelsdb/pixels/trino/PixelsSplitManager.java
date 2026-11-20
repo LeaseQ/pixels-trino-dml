@@ -38,6 +38,7 @@ import io.pixelsdb.pixels.common.index.IndexOption;
 import io.pixelsdb.pixels.common.index.service.IndexService;
 import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
 import io.pixelsdb.pixels.common.metadata.SchemaTableName;
+import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.metadata.domain.Table;
 import io.pixelsdb.pixels.common.metadata.domain.*;
 import io.pixelsdb.pixels.common.node.NodeService;
@@ -1167,6 +1168,7 @@ public class PixelsSplitManager implements ConnectorSplitManager
             }
 
             long splitId = 0;
+            Map<String, Integer> orderedRowGroupCounts = new HashMap<>();
             if (usingCache)
             {
                 Compact compact = layout.getCompact();
@@ -1228,13 +1230,15 @@ public class PixelsSplitManager implements ConnectorSplitManager
                                     // We do not cache files in the ordered paths, thus get locations from the storage.
                                     List<HostAddress> orderedAddresses = toHostAddresses(
                                             storage.getLocations(orderedFilePaths.get(firstPath)));
+                                    List<Integer> orderedRowGroupLengths = getOrderedRowGroupLengths(
+                                            paths, orderedRowGroupCounts);
 
                                     PixelsFileSplit pixelsSplit = new PixelsFileSplit(
                                             transHandle.getTransId(), splitId++, connectorId,
                                             tableHandle.getSchemaName(), tableHandle.getTableName(),
                                             table.getStorageScheme().name(), paths,
                                             Collections.nCopies(paths.size(), 0),
-                                            Collections.nCopies(paths.size(), 1),
+                                            orderedRowGroupLengths,
                                             false, storage.hasLocality(), orderedAddresses,
                                             ordered.getColumnOrder(), new ArrayList<>(0),
                                             constraint, false, false);
@@ -1327,13 +1331,15 @@ public class PixelsSplitManager implements ConnectorSplitManager
 
                             List<HostAddress> orderedAddresses = toHostAddresses(
                                     storage.getLocations(orderedFilePaths.get(firstPath)));
+                            List<Integer> orderedRowGroupLengths = getOrderedRowGroupLengths(
+                                    paths, orderedRowGroupCounts);
 
                             PixelsFileSplit pixelsSplit = new PixelsFileSplit(
                                     transHandle.getTransId(), splitId++, connectorId,
                                     tableHandle.getSchemaName(), tableHandle.getTableName(),
                                     table.getStorageScheme().name(), paths,
                                     Collections.nCopies(paths.size(), 0),
-                                    Collections.nCopies(paths.size(), 1),
+                                    orderedRowGroupLengths,
                                     false, storage.hasLocality(), orderedAddresses,
                                     ordered.getColumnOrder(), new ArrayList<>(0),
                                     constraint, false, false);
@@ -1376,6 +1382,24 @@ public class PixelsSplitManager implements ConnectorSplitManager
         }
 
         return pixelsSplits;
+    }
+
+    private List<Integer> getOrderedRowGroupLengths(List<String> paths, Map<String, Integer> cache)
+            throws MetadataException
+    {
+        MetadataService metadataService = metadataProxy.getMetadataService();
+        List<Integer> rowGroupLengths = new ArrayList<>(paths.size());
+        for (String path : paths) {
+            Integer cached = cache.get(path);
+            if (cached == null) {
+                long fileId = metadataService.getFileId(path);
+                File file = metadataService.getFileById(fileId);
+                cached = file == null ? 1 : Math.max(1, file.getNumRowGroup());
+                cache.put(path, cached);
+            }
+            rowGroupLengths.add(cached);
+        }
+        return rowGroupLengths;
     }
 
     private boolean isTagPointLookupCandidate(PixelsTableHandle tableHandle)
