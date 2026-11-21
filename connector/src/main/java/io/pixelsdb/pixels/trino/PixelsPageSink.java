@@ -27,9 +27,11 @@ import io.pixelsdb.pixels.core.vector.VectorizedRowBatch;
 import io.trino.spi.Page;
 import io.trino.spi.TrinoException;
 import io.trino.spi.block.Block;
+import io.trino.spi.block.RunLengthEncodedBlock;
 import io.trino.spi.connector.ConnectorPageSink;
 import io.trino.spi.type.DecimalType;
 import io.trino.spi.type.Int128;
+import io.trino.spi.type.Type;
 
 import java.io.IOException;
 import java.util.Collection;
@@ -156,19 +158,22 @@ final class PixelsPageSink
         }
 
         try {
-            for (int position = 0; position < page.getPositionCount(); position++) {
+            int position = 0;
+            while (position < page.getPositionCount()) {
                 if (rowBatch.isFull()) {
                     flush();
                 }
+                int rows = Math.min(page.getPositionCount() - position, rowBatch.freeSlots());
                 for (int channel = 0; channel < columns.size(); channel++) {
-                    appendValue(
-                            rowBatch.cols[channel],
-                            columns.get(channel),
-                            page.getBlock(channel),
-                            position);
+                    appendColumnValues(rowBatch.cols[channel], columns.get(channel),
+                            page.getBlock(channel), position, rows);
                 }
-                ((LongColumnVector) rowBatch.cols[rowBatch.cols.length - 1]).add(commitTimestamp);
-                rowBatch.size++;
+                LongColumnVector hidden = (LongColumnVector) rowBatch.cols[rowBatch.cols.length - 1];
+                for (int i = 0; i < rows; i++) {
+                    hidden.add(commitTimestamp);
+                }
+                rowBatch.size += rows;
+                position += rows;
             }
         }
         catch (IOException e) {
@@ -355,6 +360,121 @@ final class PixelsPageSink
             default:
                 throw new TrinoException(PIXELS_DATA_TYPE_ERROR,
                         "Pixels INSERT does not support column type " + category + " yet");
+        }
+    }
+
+    private static void appendColumnValues(ColumnVector target, PixelsColumnHandle column,
+            Block block, int offset, int length)
+    {
+        if (block instanceof RunLengthEncodedBlock) {
+            appendRepeated(target, column, ((RunLengthEncodedBlock) block).getValue(), length);
+            return;
+        }
+        for (int i = 0; i < length; i++) {
+            appendValue(target, column, block, offset + i);
+        }
+    }
+
+    private static void appendRepeated(ColumnVector target, PixelsColumnHandle column,
+            Block valueBlock, int length)
+    {
+        if (valueBlock.isNull(0)) {
+            for (int i = 0; i < length; i++) {
+                target.addNull();
+            }
+            return;
+        }
+
+        Type type = column.getColumnType();
+        switch (column.getTypeCategory()) {
+            case BOOLEAN:
+                boolean booleanValue = type.getBoolean(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    ((BooleanColumnVector) target).add(booleanValue);
+                }
+                break;
+            case BYTE:
+                byte byteValue = (byte) type.getLong(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    ((ByteColumnVector) target).add(byteValue);
+                }
+                break;
+            case SHORT:
+                short shortValue = (short) type.getLong(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    ((ShortColumnVector) target).add(shortValue);
+                }
+                break;
+            case INT:
+                int intValue = (int) type.getLong(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    ((IntColumnVector) target).add(intValue);
+                }
+                break;
+            case LONG:
+                long longValue = type.getLong(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    ((LongColumnVector) target).add(longValue);
+                }
+                break;
+            case FLOAT:
+                float floatValue = (float) type.getDouble(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    ((FloatColumnVector) target).add(floatValue);
+                }
+                break;
+            case DOUBLE:
+                double doubleValue = type.getDouble(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    ((DoubleColumnVector) target).add(doubleValue);
+                }
+                break;
+            case DATE:
+                int dateValue = (int) type.getLong(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    ((DateColumnVector) target).add(dateValue);
+                }
+                break;
+            case TIME:
+                int timeValue = (int) (type.getLong(valueBlock, 0) / 1_000_000_000L);
+                for (int i = 0; i < length; i++) {
+                    ((TimeColumnVector) target).add(timeValue);
+                }
+                break;
+            case TIMESTAMP:
+                long timestampValue = type.getLong(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    ((TimestampColumnVector) target).add(timestampValue);
+                }
+                break;
+            case DECIMAL:
+                DecimalType decimalType = (DecimalType) type;
+                if (decimalType.isShort()) {
+                    long decimalValue = decimalType.getLong(valueBlock, 0);
+                    for (int i = 0; i < length; i++) {
+                        ((DecimalColumnVector) target).add(decimalValue);
+                    }
+                }
+                else {
+                    Int128 decimalValue = (Int128) decimalType.getObject(valueBlock, 0);
+                    for (int i = 0; i < length; i++) {
+                        ((LongDecimalColumnVector) target).add(decimalValue.getHigh(), decimalValue.getLow());
+                    }
+                }
+                break;
+            case STRING:
+            case BINARY:
+            case VARBINARY:
+            case CHAR:
+            case VARCHAR:
+                Slice slice = type.getSlice(valueBlock, 0);
+                for (int i = 0; i < length; i++) {
+                    appendSlice((BinaryColumnVector) target, slice);
+                }
+                break;
+            default:
+                throw new TrinoException(PIXELS_DATA_TYPE_ERROR,
+                        "Pixels INSERT does not support column type " + column.getTypeCategory() + " yet");
         }
     }
 
