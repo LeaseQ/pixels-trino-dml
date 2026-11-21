@@ -366,7 +366,7 @@ final class PixelsPageSink
         }
         else {
             Int128 value = (Int128) type.getObject(block, position);
-            ((LongDecimalColumnVector) target).add(value);
+            ((LongDecimalColumnVector) target).add(value.getHigh(), value.getLow());
         }
     }
 }
