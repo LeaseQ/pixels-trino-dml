@@ -32,7 +32,6 @@ import io.trino.spi.type.DecimalType;
 import io.trino.spi.type.Int128;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -363,12 +362,11 @@ final class PixelsPageSink
     {
         DecimalType type = (DecimalType) column.getColumnType();
         if (type.isShort()) {
-            ((DecimalColumnVector) target).add(ByteBuffer.allocate(Long.BYTES)
-                    .putLong(type.getLong(block, position)).array());
+            ((DecimalColumnVector) target).add(type.getLong(block, position));
         }
         else {
             Int128 value = (Int128) type.getObject(block, position);
-            ((LongDecimalColumnVector) target).add(value.toBigEndianBytes());
+            ((LongDecimalColumnVector) target).add(value);
         }
     }
 }
