@@ -63,7 +63,7 @@ public class PixelsOffloadDetector
 
         long checkInterval = 5;
         this.scheduler.scheduleAtFixedRate(
-                this::detectAndOffload, checkInterval, checkInterval, TimeUnit.SECONDS);
+                this::safeDetectAndOffload, checkInterval, checkInterval, TimeUnit.SECONDS);
         
         logger.info("PixelsOffloadDetector started with threshold=%d s, check interval=%d s",
                 offloadThreshold, checkInterval);
@@ -103,6 +103,22 @@ public class PixelsOffloadDetector
     /**
      * Periodically detect and offload long-running queries.
      */
+    private void safeDetectAndOffload()
+    {
+        // ScheduledExecutorService suppresses all subsequent executions when a
+        // scheduled task exits with an unchecked exception.  Lease renewal is
+        // a liveness mechanism, so one transient gRPC/runtime failure must not
+        // silently disable it for the rest of a multi-minute INSERT.
+        try
+        {
+            detectAndOffload();
+        }
+        catch (Throwable t)
+        {
+            logger.error(t, "Pixels offload/lease detector iteration failed");
+        }
+    }
+
     private void detectAndOffload()
     {
         long now = System.currentTimeMillis();
