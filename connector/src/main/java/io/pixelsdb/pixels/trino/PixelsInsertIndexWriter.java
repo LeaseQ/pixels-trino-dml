@@ -42,6 +42,13 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     /** Experimental opt-in parallelism for independent vnode primary-index RPCs. */
     static final String PRIMARY_FLUSH_PARALLELISM_PROPERTY =
             "pixels.insert.index.flush.parallelism";
+    /** Experimental opt-in single-request batching across vnode primary-index writes. */
+    static final String GROUPED_PRIMARY_WRITE_PROPERTY =
+            "pixels.insert.index.grouped.primary.write";
+    /** Keep grouped requests below the daemon's default 64 MiB inbound RPC limit. */
+    static final String GROUPED_PRIMARY_WRITE_MAX_ENTRIES_PROPERTY =
+            "pixels.insert.index.grouped.primary.write.max.entries";
+    static final int DEFAULT_GROUPED_PRIMARY_WRITE_MAX_ENTRIES = 200_000;
     private final IndexService indexService;
     private final RowIdAllocator rowIdAllocator;
     private final long tableId;
@@ -192,6 +199,10 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
         if (buckets.isEmpty()) {
             return;
         }
+        if (!hadStagedBucketFlush && Boolean.getBoolean(GROUPED_PRIMARY_WRITE_PROPERTY)) {
+            flushPendingBucketsGrouped(buckets);
+            return;
+        }
         // A large INSERT may have already flushed the first batch of a bucket
         // while appendBatch was still producing rows. Keep later batches
         // serialized until mixed serial/parallel writes prove fully visible.
@@ -251,6 +262,45 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
         finally {
             executor.shutdownNow();
         }
+    }
+
+    private void flushPendingBucketsGrouped(List<Integer> buckets) throws IOException, IndexException
+    {
+        List<IndexProto.PrimaryIndexEntry> entries = new ArrayList<>();
+        for (Integer bucket : buckets) {
+            entries.addAll(pendingEntriesByBucket.get(bucket));
+        }
+        int maxEntries = configuredGroupedPrimaryWriteMaxEntries();
+        for (int offset = 0; offset < entries.size(); offset += maxEntries) {
+            int end = Math.min(entries.size(), offset + maxEntries);
+            List<IndexProto.PrimaryIndexEntry> chunk = entries.subList(offset, end);
+            long start = System.nanoTime();
+            if (!indexService.putPrimaryIndexEntries(tableId, indexId, chunk,
+                    IndexOption.builder().vNodeId(-1).build())) {
+                throw new IOException("failed to write grouped Pixels INSERT primary index entries");
+            }
+            primaryPutNanos += System.nanoTime() - start;
+            primaryRpcCount++;
+            recordCompletedGroupedEntries(chunk);
+        }
+        for (Integer bucket : buckets) {
+            pendingEntriesByBucket.remove(bucket);
+        }
+    }
+
+    private void recordCompletedGroupedEntries(List<IndexProto.PrimaryIndexEntry> entries)
+    {
+        for (IndexProto.PrimaryIndexEntry entry : entries) {
+            int bucket = bucketIdResolver.applyAsInt(entry.getIndexKey().getKey());
+            insertedKeysByBucket.computeIfAbsent(bucket, ignored -> new ArrayList<>())
+                    .add(entry.getIndexKey());
+        }
+    }
+
+    private int configuredGroupedPrimaryWriteMaxEntries()
+    {
+        return Math.max(1, Integer.getInteger(GROUPED_PRIMARY_WRITE_MAX_ENTRIES_PROPERTY,
+                DEFAULT_GROUPED_PRIMARY_WRITE_MAX_ENTRIES));
     }
 
     private int configuredPrimaryFlushParallelism()
