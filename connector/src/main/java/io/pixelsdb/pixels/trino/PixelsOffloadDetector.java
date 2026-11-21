@@ -114,6 +114,26 @@ public class PixelsOffloadDetector
                 continue;
             }
 
+            // A Pixels write transaction has a finite assigner lease.  Cold
+            // INSERTs can spend several minutes opening the vnode indexes
+            // before Trino reaches connector.commit().  Keep the lease alive
+            // while the query is still active; otherwise durable files can be
+            // published and the final commit can still fail with
+            // TRANS_LEASE_EXPIRED.
+            try
+            {
+                if (!this.transService.extendTransLease(context))
+                {
+                    logger.warn("Transaction lease already expired for transId=%d", context.getTransId());
+                    continue;
+                }
+            }
+            catch (TransException e)
+            {
+                logger.error(e, "Failed to extend transaction lease for transId=%d", context.getTransId());
+                continue;
+            }
+
             long runningTime = now - context.getStartTime();
             if (runningTime > offloadThreshold)
             {
