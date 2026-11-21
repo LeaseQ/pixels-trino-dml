@@ -350,11 +350,28 @@ final class PixelsPageSink
             case CHAR:
             case VARCHAR:
                 Slice slice = column.getColumnType().getSlice(block, position);
-                ((BinaryColumnVector) target).add(slice.getBytes());
+                appendSlice((BinaryColumnVector) target, slice);
                 break;
             default:
                 throw new TrinoException(PIXELS_DATA_TYPE_ERROR,
                         "Pixels INSERT does not support column type " + category + " yet");
+        }
+    }
+
+    /**
+     * Keep heap-backed Trino slices by reference.  The page sink writes the
+     * batch synchronously before returning from appendPage, and the vector
+     * itself retains the backing array until the batch is flushed or reset.
+     * Direct/non-heap slices use the existing copying fallback.
+     */
+    private static void appendSlice(BinaryColumnVector target, Slice slice)
+    {
+        try {
+            target.setRef(target.getWriteIndex(), slice.byteArray(),
+                    slice.byteArrayOffset(), slice.length());
+        }
+        catch (UnsupportedOperationException e) {
+            target.add(slice.getBytes());
         }
     }
 
