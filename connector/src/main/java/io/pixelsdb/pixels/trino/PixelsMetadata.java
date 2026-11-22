@@ -82,7 +82,8 @@ import static java.util.stream.Collectors.toList;
 public class PixelsMetadata implements ConnectorMetadata
 {
     private static final Logger logger = Logger.get(PixelsMetadata.class);
-    private static final int PRIMARY_KEY_RESOLVE_BATCH_SIZE = 65_536;
+    private static final int PRIMARY_KEY_RESOLVE_BATCH_SIZE = Integer.getInteger(
+            "pixels.update.primary-key-resolve-batch-size", 65_536);
     private record PrimaryKeyResolution(long tableId, long indexId, List<PixelsColumnHandle> columns) {}
     private static final JsonCodec<ConnectorViewDefinition> ViewCodec =
             new JsonCodecFactory(new ObjectMapperProvider()).jsonCodec(ConnectorViewDefinition.class);
