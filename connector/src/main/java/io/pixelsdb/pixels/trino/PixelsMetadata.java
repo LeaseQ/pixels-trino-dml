@@ -1024,6 +1024,7 @@ public class PixelsMetadata implements ConnectorMetadata
     public void createSchema(ConnectorSession session, String schemaName,
                              Map<String, Object> properties, TrinoPrincipal _owner)
     {
+        transHandle.markWriteOperation();
         try
         {
             boolean res = this.metadataProxy.createSchema(schemaName);
@@ -1041,6 +1042,7 @@ public class PixelsMetadata implements ConnectorMetadata
     @Override
     public void dropSchema(ConnectorSession session, String schemaName, boolean cascade)
     {
+        transHandle.markWriteOperation();
         if (cascade)
         {
             try
@@ -1530,6 +1532,7 @@ public class PixelsMetadata implements ConnectorMetadata
     public void createView(ConnectorSession session, SchemaTableName viewName,
                            ConnectorViewDefinition definition, Map<String, Object> viewProperties, boolean replace)
     {
+        transHandle.markWriteOperation();
         /**
          * Issue #6:
          * API change in Trino 315 https://trino.io/docs/current/release/release-315.html:
@@ -1557,6 +1560,7 @@ public class PixelsMetadata implements ConnectorMetadata
     @Override
     public void dropView(ConnectorSession session, SchemaTableName viewName)
     {
+        transHandle.markWriteOperation();
         try
         {
             boolean res = this.metadataProxy.dropView(viewName.getSchemaName(), viewName.getTableName());
