@@ -28,12 +28,14 @@ import io.trino.spi.Page;
 import io.trino.spi.TrinoException;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.RunLengthEncodedBlock;
+import io.trino.spi.block.ValueBlock;
 import io.trino.spi.connector.ConnectorPageSink;
 import io.trino.spi.type.DecimalType;
 import io.trino.spi.type.Int128;
 import io.trino.spi.type.Type;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -370,9 +372,42 @@ final class PixelsPageSink
             appendRepeated(target, column, ((RunLengthEncodedBlock) block).getValue(), length);
             return;
         }
+        if (length > 0 && isAllNull(block, offset, length)) {
+            appendNulls(target, length);
+            return;
+        }
         for (int i = 0; i < length; i++) {
             appendValue(target, column, block, offset + i);
         }
+    }
+
+    /**
+     * Detect the common all-null page-column case without changing the general
+     * Block conversion path.  ValueBlock exposes a null bitmap; blocks without
+     * one are either null-free or require their existing per-position handling.
+     */
+    private static boolean isAllNull(Block block, int offset, int length)
+    {
+        if (!(block instanceof ValueBlock valueBlock) || valueBlock.getNulls().isEmpty()) {
+            return false;
+        }
+        int end = offset + length;
+        for (int position = offset; position < end; position++) {
+            if (!block.isNull(position)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void appendNulls(ColumnVector target, int length)
+    {
+        int start = target.getWriteIndex();
+        int end = start + length;
+        target.ensureSize(end, true);
+        Arrays.fill(target.isNull, start, end, true);
+        target.noNulls = false;
+        target.pushWriteIndex(length);
     }
 
     private static void appendRepeated(ColumnVector target, PixelsColumnHandle column,
