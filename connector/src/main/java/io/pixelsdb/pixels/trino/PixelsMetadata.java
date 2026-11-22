@@ -245,6 +245,7 @@ public class PixelsMetadata implements ConnectorMetadata
     {
         requireNonNull(columns, "columns is null");
         PixelsTableHandle pixelsTableHandle = requirePixelsBaseTable(tableHandle);
+        transHandle.markWriteOperation();
         List<PixelsColumnHandle> writeColumns = columns.stream()
                 .map(PixelsMetadata::requirePixelsColumn)
                 .collect(toImmutableList());
@@ -259,6 +260,7 @@ public class PixelsMetadata implements ConnectorMetadata
             Collection<io.airlift.slice.Slice> fragments,
             Collection<io.trino.spi.statistics.ComputedStatistics> computedStatistics)
     {
+        transHandle.markWriteOperation();
         if (!(insertHandle instanceof PixelsInsertTableHandle pixelsInsertTableHandle)) {
             throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
                     "Pixels INSERT received an invalid insert handle");
@@ -357,6 +359,7 @@ public class PixelsMetadata implements ConnectorMetadata
         }
 
         PixelsTableHandle pixelsTableHandle = requirePixelsBaseTable(tableHandle);
+        transHandle.markWriteOperation();
         Map<PixelsColumnHandle, Constant> pixelAssignments = new LinkedHashMap<>();
         for (Map.Entry<ColumnHandle, Constant> assignment : assignments.entrySet())
         {
@@ -454,6 +457,7 @@ public class PixelsMetadata implements ConnectorMetadata
             throw new TrinoException(PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR,
                     "Pixels merge currently supports UPDATE only; DELETE is not supported");
         }
+        transHandle.markWriteOperation();
         PixelsTableHandle pixelsTableHandle = requirePixelsBaseTable(tableHandle);
         try
         {
@@ -887,6 +891,7 @@ public class PixelsMetadata implements ConnectorMetadata
     @Override
     public void createTable(ConnectorSession session, ConnectorTableMetadata tableMetadata, SaveMode saveMode)
     {
+        transHandle.markWriteOperation();
         SchemaTableName schemaTableName = tableMetadata.getTable();
         String schemaName = schemaTableName.getSchemaName();
         String tableName = schemaTableName.getTableName();
@@ -995,6 +1000,7 @@ public class PixelsMetadata implements ConnectorMetadata
     @Override
     public void dropTable(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
+        transHandle.markWriteOperation();
         PixelsTableHandle pixelsTableHandle = (PixelsTableHandle) tableHandle;
         String schemaName = pixelsTableHandle.getSchemaName();
         String tableName = pixelsTableHandle.getTableName();

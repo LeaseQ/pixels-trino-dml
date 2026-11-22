@@ -120,7 +120,10 @@ public class PixelsConnector implements Connector
              * statements through the readOnly flag (see the comment below),
              * so the connector must allocate a write timestamp here.  Reads
              * still use the timestamp as their snapshot; the validation
-             * runtime commits the short-lived transaction normally.
+             * runtime commits the short-lived transaction normally.  The
+             * connector records whether metadata actually entered a write
+             * path and reclassifies read-only statements before termination
+             * so the daemon can advance the low watermark safely.
              */
             context = this.transService.beginTrans(false);
             // The common client only initializes these caches for transactions
@@ -177,9 +180,18 @@ public class PixelsConnector implements Connector
                 this.offloadDetector.unregisterQuery(handle.getTransId());
                 
                 this.toDoBeforeTransTermination(handle);
+                // Trino begins with a write timestamp because its readOnly
+                // argument is false for ordinary statements. Reclassify a
+                // transaction that never entered a write metadata path so
+                // Retina can advance the low watermark safely.
+                boolean readOnly = !handle.hasWriteOperation();
+                if (readOnly)
+                {
+                    this.transService.markTransReadOnly(handle.getTransId());
+                }
                 // commit the transaction
                 long commitStart = System.nanoTime();
-                this.transService.commitTrans(handle.getTransId(), handle.isReadOnly());
+                this.transService.commitTrans(handle.getTransId(), readOnly);
                 logger.info("[PIXELS_INSERT_COMMIT_METRIC] trans_id=%s commit_ms=%.3f",
                         handle.getTransId(), (System.nanoTime() - commitStart) / 1_000_000.0);
                 MetadataCache.Instance().dropCache(handle.getTransId());
@@ -218,8 +230,13 @@ public class PixelsConnector implements Connector
                 this.offloadDetector.unregisterQuery(handle.getTransId());
                 
                 this.toDoBeforeTransTermination(handle);
+                boolean readOnly = !handle.hasWriteOperation();
+                if (readOnly)
+                {
+                    this.transService.markTransReadOnly(handle.getTransId());
+                }
                 // rollback the transaction
-                this.transService.rollbackTrans(handle.getTransId(), handle.isReadOnly());
+                this.transService.rollbackTrans(handle.getTransId(), readOnly);
                 MetadataCache.Instance().dropCache(handle.getTransId());
             } catch (TransException e)
             {

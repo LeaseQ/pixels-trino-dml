@@ -39,6 +39,8 @@ public class PixelsTransactionHandle implements ConnectorTransactionHandle
      * Whether the transaction is read only.
      */
     private final boolean readOnly;
+    /** Set by connector metadata when this transaction performs a write. */
+    private volatile boolean writeOperation;
     /**
      * The type of executor to execute this query.
      */
@@ -69,6 +71,7 @@ public class PixelsTransactionHandle implements ConnectorTransactionHandle
         this.transId = transId;
         this.timestamp = timestamp;
         this.readOnly = readOnly;
+        this.writeOperation = false;
         this.executorType = executorType;
         this.scanBytes = new AtomicDouble(0);
         this.cfCostCents = new AtomicDouble(0);
@@ -90,6 +93,16 @@ public class PixelsTransactionHandle implements ConnectorTransactionHandle
     public boolean isReadOnly()
     {
         return this.readOnly;
+    }
+
+    boolean hasWriteOperation()
+    {
+        return writeOperation;
+    }
+
+    void markWriteOperation()
+    {
+        writeOperation = true;
     }
 
     @JsonProperty
