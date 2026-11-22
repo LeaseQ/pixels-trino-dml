@@ -48,9 +48,15 @@ final class PixelsUpdateExecutor
         }
     }
 
+    interface PrimaryKeyResolver
+    {
+        /** Return only keys that exist in the primary index at the statement snapshot. */
+        List<byte[]> resolveExisting(List<byte[]> primaryKeys);
+    }
+
     record TagUpdate(String columnName, byte[] tag, List<byte[]> primaryKeys) {}
 
-    record Result(long updatedRows, long encodingNanos) {}
+    record Result(long updatedRows, long encodingNanos, long primaryKeyResolveNanos) {}
 
     static long execute(
             PixelsUpdateTableHandle update,
@@ -59,7 +65,8 @@ final class PixelsUpdateExecutor
     {
         requireNonNull(update, "update is null");
         requireNonNull(primaryIndex, "primaryIndex is null");
-        return executeWithMetrics(update, resolvePrimaryKeyColumns(update, primaryIndex), tagIndex).updatedRows();
+        return executeWithMetrics(update, resolvePrimaryKeyColumns(update, primaryIndex), tagIndex,
+                primaryKeys -> primaryKeys).updatedRows();
     }
 
     static Result executeWithMetrics(
@@ -67,13 +74,23 @@ final class PixelsUpdateExecutor
             List<PixelsColumnHandle> primaryKeyColumns,
             TagIndex tagIndex)
     {
+        return executeWithMetrics(update, primaryKeyColumns, tagIndex, primaryKeys -> primaryKeys);
+    }
+
+    static Result executeWithMetrics(
+            PixelsUpdateTableHandle update,
+            List<PixelsColumnHandle> primaryKeyColumns,
+            TagIndex tagIndex,
+            PrimaryKeyResolver primaryKeyResolver)
+    {
         requireNonNull(update, "update is null");
         requireNonNull(primaryKeyColumns, "primaryKeyColumns is null");
         requireNonNull(tagIndex, "tagIndex is null");
+        requireNonNull(primaryKeyResolver, "primaryKeyResolver is null");
 
         TupleDomain<PixelsColumnHandle> constraint = update.getTableHandle().getConstraint();
         if (constraint.isNone()) {
-            return new Result(0L, 0L);
+            return new Result(0L, 0L, 0L);
         }
         Map<PixelsColumnHandle, Domain> domains = constraint.getDomains()
                 .orElseThrow(() -> new IllegalArgumentException(
@@ -84,6 +101,10 @@ final class PixelsUpdateExecutor
         }
         long encodingStart = System.nanoTime();
         List<byte[]> primaryKeys = encodePrimaryKeys(primaryKeyColumns, domains);
+        long encodedNanos = System.nanoTime() - encodingStart;
+        long resolveStart = System.nanoTime();
+        primaryKeys = primaryKeyResolver.resolveExisting(primaryKeys);
+        long primaryKeyResolveNanos = System.nanoTime() - resolveStart;
 
         List<TagUpdate> tagUpdates = new ArrayList<>(update.getAssignments().size());
         for (PixelsUpdateTableHandle.PixelsUpdateAssignment assignment : update.getAssignments()) {
@@ -97,9 +118,8 @@ final class PixelsUpdateExecutor
             byte[] tag = encodeAssignment(column, assignment.getValue());
             tagUpdates.add(new TagUpdate(columnName, tag, primaryKeys));
         }
-        long encodingNanos = System.nanoTime() - encodingStart;
         tagIndex.appendShared(tagUpdates);
-        return new Result(primaryKeys.size(), encodingNanos);
+        return new Result(primaryKeys.size(), encodedNanos, primaryKeyResolveNanos);
     }
 
     private static List<PixelsColumnHandle> resolvePrimaryKeyColumns(

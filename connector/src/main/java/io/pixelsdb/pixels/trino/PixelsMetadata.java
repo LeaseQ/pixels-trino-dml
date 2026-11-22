@@ -82,6 +82,7 @@ import static java.util.stream.Collectors.toList;
 public class PixelsMetadata implements ConnectorMetadata
 {
     private static final Logger logger = Logger.get(PixelsMetadata.class);
+    private static final int PRIMARY_KEY_RESOLVE_BATCH_SIZE = 65_536;
     private record PrimaryKeyResolution(long tableId, long indexId, List<PixelsColumnHandle> columns) {}
     private static final JsonCodec<ConnectorViewDefinition> ViewCodec =
             new JsonCodecFactory(new ObjectMapperProvider()).jsonCodec(ConnectorViewDefinition.class);
@@ -571,6 +572,36 @@ public class PixelsMetadata implements ConnectorMetadata
             final long[] requestBytes = {0L};
             final long[] requestBuildNanos = {0L};
             final String[] requestMode = {"shared"};
+            PixelsUpdateExecutor.PrimaryKeyResolver primaryKeyResolver = primaryKeys -> {
+                if (primaryKeys.isEmpty()) {
+                    return List.of();
+                }
+                List<byte[]> existingKeys = new ArrayList<>(primaryKeys.size());
+                for (int offset = 0; offset < primaryKeys.size(); offset += PRIMARY_KEY_RESOLVE_BATCH_SIZE) {
+                    int end = Math.min(primaryKeys.size(), offset + PRIMARY_KEY_RESOLVE_BATCH_SIZE);
+                    List<io.pixelsdb.pixels.index.IndexProto.IndexKey> lookupKeys = new ArrayList<>(end - offset);
+                    for (int i = offset; i < end; i++) {
+                        lookupKeys.add(io.pixelsdb.pixels.index.IndexProto.IndexKey.newBuilder()
+                                .setTableId(resolvedTableId)
+                                .setIndexId(resolvedIndexId)
+                                .setKey(ByteString.copyFrom(primaryKeys.get(i)))
+                                .setTimestamp(transHandle.getTimestamp())
+                                .build());
+                    }
+                    try {
+                        for (io.pixelsdb.pixels.index.IndexProto.ResolvePrimaryEntry entry :
+                                indexService.resolvePrimaryEntries(
+                                        resolvedTableId, resolvedIndexId, lookupKeys, true)) {
+                            existingKeys.add(entry.getIndexKey().getKey().toByteArray());
+                        }
+                    }
+                    catch (IndexException e) {
+                        throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                                "failed to resolve existing Pixels UPDATE primary keys", e);
+                    }
+                }
+                return existingKeys;
+            };
             PixelsUpdateExecutor.Result result = PixelsUpdateExecutor.executeWithMetrics(
                     updateHandle, resolvedPrimaryKeyColumns, new PixelsUpdateExecutor.TagIndex()
                     {
@@ -669,12 +700,13 @@ public class PixelsMetadata implements ConnectorMetadata
                                         "failed to append Pixels UPDATE tag index through IndexServer", e);
                             }
                         }
-                    });
+                    }, primaryKeyResolver);
             logger.info("[PIXELS_UPDATE_METRIC] table=%s rows=%d mode=%s metadata_ms=%.3f encoding_ms=%.3f " +
-                            "request_build_ms=%.3f rpc_count=%d request_bytes=%d rpc_ms=%.3f total_ms=%.3f",
+                            "primary_key_resolve_ms=%.3f request_build_ms=%.3f rpc_count=%d request_bytes=%d rpc_ms=%.3f total_ms=%.3f",
                     pixelsTableHandle.getSchemaTableName(), result.updatedRows(),
                     requestMode[0],
                     nanosToMillis(metadataNanos), nanosToMillis(result.encodingNanos()),
+                    nanosToMillis(result.primaryKeyResolveNanos()),
                     nanosToMillis(requestBuildNanos[0]), rpcCount[0], requestBytes[0],
                     nanosToMillis(rpcNanos[0]), nanosToMillis(System.nanoTime() - totalStart));
             return OptionalLong.of(result.updatedRows());

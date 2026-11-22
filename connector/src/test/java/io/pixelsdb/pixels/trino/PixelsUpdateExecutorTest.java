@@ -145,6 +145,26 @@ class PixelsUpdateExecutorTest
     }
 
     @Test
+    void onlyTagsPrimaryKeysReturnedByTheExistenceResolver()
+    {
+        PixelsColumnHandle id = column("id", BigintType.BIGINT, LONG, 0);
+        PixelsColumnHandle label = column("label", VarcharType.VARCHAR, STRING, 1);
+        Domain keys = Domain.create(ValueSet.ofRanges(
+                Range.range(BigintType.BIGINT, 1L, true, 3L, true)), false);
+        PixelsUpdateTableHandle update = new PixelsUpdateTableHandle(
+                tableHandle(List.of(id, label), TupleDomain.withColumnDomains(Map.of(id, keys))),
+                Map.of(label, new Constant("vip", VarcharType.VARCHAR)));
+        CountingTagIndex index = new CountingTagIndex();
+
+        PixelsUpdateExecutor.Result result = PixelsUpdateExecutor.executeWithMetrics(
+                update, List.of(id), index,
+                primaryKeys -> List.of(primaryKeys.get(0), primaryKeys.get(2)));
+
+        assertEquals(2L, result.updatedRows());
+        assertEquals(2L, index.primaryKeyCount);
+    }
+
+    @Test
     void handlesTheMaximumLongPrimaryKeyWithoutOverflowingTheRangeLoop()
     {
         PixelsColumnHandle id = column("id", BigintType.BIGINT, LONG, 0);
