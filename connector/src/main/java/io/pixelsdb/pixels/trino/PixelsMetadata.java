@@ -65,6 +65,10 @@ import io.trino.spi.statistics.TableStatistics;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Verify.verify;
@@ -84,6 +88,8 @@ public class PixelsMetadata implements ConnectorMetadata
     private static final Logger logger = Logger.get(PixelsMetadata.class);
     private static final int PRIMARY_KEY_RESOLVE_BATCH_SIZE = Integer.getInteger(
             "pixels.update.primary-key-resolve-batch-size", 65_536);
+    private static final int PRIMARY_KEY_RESOLVE_PARALLELISM = Math.max(1, Integer.getInteger(
+            "pixels.update.primary-key-resolve-parallelism", 1));
     private record PrimaryKeyResolution(long tableId, long indexId, List<PixelsColumnHandle> columns) {}
     private static final JsonCodec<ConnectorViewDefinition> ViewCodec =
             new JsonCodecFactory(new ObjectMapperProvider()).jsonCodec(ConnectorViewDefinition.class);
@@ -542,6 +548,26 @@ public class PixelsMetadata implements ConnectorMetadata
         return resolvePrimaryKeyResolution(tableHandle).columns();
     }
 
+    private static List<byte[]> resolvePrimaryKeyBatch(
+            IndexService indexService,
+            long tableId,
+            long indexId,
+            List<io.pixelsdb.pixels.index.IndexProto.IndexKey> lookupKeys)
+    {
+        try {
+            List<byte[]> existingKeys = new ArrayList<>(lookupKeys.size());
+            for (io.pixelsdb.pixels.index.IndexProto.ResolvePrimaryEntry entry :
+                    indexService.resolvePrimaryEntries(tableId, indexId, lookupKeys, true)) {
+                existingKeys.add(entry.getIndexKey().getKey().toByteArray());
+            }
+            return existingKeys;
+        }
+        catch (IndexException e) {
+            throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                    "failed to resolve existing Pixels UPDATE primary keys", e);
+        }
+    }
+
     @Override
     public OptionalLong executeUpdate(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
@@ -578,6 +604,7 @@ public class PixelsMetadata implements ConnectorMetadata
                     return List.of();
                 }
                 List<byte[]> existingKeys = new ArrayList<>(primaryKeys.size());
+                List<List<io.pixelsdb.pixels.index.IndexProto.IndexKey>> batches = new ArrayList<>();
                 for (int offset = 0; offset < primaryKeys.size(); offset += PRIMARY_KEY_RESOLVE_BATCH_SIZE) {
                     int end = Math.min(primaryKeys.size(), offset + PRIMARY_KEY_RESOLVE_BATCH_SIZE);
                     List<io.pixelsdb.pixels.index.IndexProto.IndexKey> lookupKeys = new ArrayList<>(end - offset);
@@ -589,16 +616,46 @@ public class PixelsMetadata implements ConnectorMetadata
                                 .setTimestamp(transHandle.getTimestamp())
                                 .build());
                     }
+                    batches.add(lookupKeys);
+                }
+                int workerCount = Math.min(PRIMARY_KEY_RESOLVE_PARALLELISM, batches.size());
+                if (workerCount == 1) {
+                    for (List<io.pixelsdb.pixels.index.IndexProto.IndexKey> batch : batches) {
+                        existingKeys.addAll(resolvePrimaryKeyBatch(
+                                indexService, resolvedTableId, resolvedIndexId, batch));
+                    }
+                }
+                else {
+                    ExecutorService executor = Executors.newFixedThreadPool(workerCount);
                     try {
-                        for (io.pixelsdb.pixels.index.IndexProto.ResolvePrimaryEntry entry :
-                                indexService.resolvePrimaryEntries(
-                                        resolvedTableId, resolvedIndexId, lookupKeys, true)) {
-                            existingKeys.add(entry.getIndexKey().getKey().toByteArray());
+                        // Keep the futures in input order so the resolver's contract remains stable,
+                        // while allowing the independent snapshot lookups to overlap on the wire.
+                        List<Future<List<byte[]>>> futures = new ArrayList<>(batches.size());
+                        for (List<io.pixelsdb.pixels.index.IndexProto.IndexKey> batch : batches) {
+                            futures.add(executor.submit(() -> resolvePrimaryKeyBatch(
+                                    indexService, resolvedTableId, resolvedIndexId, batch)));
+                        }
+                        for (Future<List<byte[]>> future : futures) {
+                            try {
+                                existingKeys.addAll(future.get());
+                            }
+                            catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                                        "interrupted while resolving existing Pixels UPDATE primary keys", e);
+                            }
+                            catch (ExecutionException e) {
+                                Throwable cause = e.getCause();
+                                if (cause instanceof TrinoException trinoException) {
+                                    throw trinoException;
+                                }
+                                throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
+                                        "failed to resolve existing Pixels UPDATE primary keys", cause);
+                            }
                         }
                     }
-                    catch (IndexException e) {
-                        throw new TrinoException(PixelsErrorCode.PIXELS_INVERTED_INDEX_ERROR,
-                                "failed to resolve existing Pixels UPDATE primary keys", e);
+                    finally {
+                        executor.shutdownNow();
                     }
                 }
                 return existingKeys;
