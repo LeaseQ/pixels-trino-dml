@@ -49,8 +49,11 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     /** Optional process-wide cap for concurrent grouped primary-index RPCs. */
     static final String PRIMARY_FLUSH_MAX_CONCURRENCY_PROPERTY =
             "pixels.insert.index.flush.max-concurrency";
-    /** Zero keeps the historical unlimited grouped-RPC behavior. */
-    static final int DEFAULT_PRIMARY_FLUSH_MAX_CONCURRENCY = 0;
+    /**
+     * Keep the grouped primary-index queue bounded by default. Set the JVM
+     * property to zero to explicitly restore unlimited concurrency.
+     */
+    static final int DEFAULT_PRIMARY_FLUSH_MAX_CONCURRENCY = 24;
     private static final Semaphore primaryFlushSemaphore = createPrimaryFlushSemaphore();
     /** Keep grouped requests below the daemon's default 64 MiB inbound RPC limit. */
     static final String GROUPED_PRIMARY_WRITE_MAX_ENTRIES_PROPERTY =
