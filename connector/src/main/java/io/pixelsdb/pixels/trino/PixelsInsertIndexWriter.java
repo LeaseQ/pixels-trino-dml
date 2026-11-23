@@ -26,6 +26,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.function.ToIntFunction;
 
 import static java.util.Objects.requireNonNull;
@@ -45,6 +46,12 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     /** Experimental opt-in single-request batching across vnode primary-index writes. */
     static final String GROUPED_PRIMARY_WRITE_PROPERTY =
             "pixels.insert.index.grouped.primary.write";
+    /** Optional process-wide cap for concurrent grouped primary-index RPCs. */
+    static final String PRIMARY_FLUSH_MAX_CONCURRENCY_PROPERTY =
+            "pixels.insert.index.flush.max-concurrency";
+    /** Zero keeps the historical unlimited grouped-RPC behavior. */
+    static final int DEFAULT_PRIMARY_FLUSH_MAX_CONCURRENCY = 0;
+    private static final Semaphore primaryFlushSemaphore = createPrimaryFlushSemaphore();
     /** Keep grouped requests below the daemon's default 64 MiB inbound RPC limit. */
     static final String GROUPED_PRIMARY_WRITE_MAX_ENTRIES_PROPERTY =
             "pixels.insert.index.grouped.primary.write.max.entries";
@@ -178,11 +185,12 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
             }
             mainFlushNanos += System.nanoTime() - flushStart;
             finished = true;
-            logger.info("[PIXELS_INSERT_INDEX_METRIC] file_id=%s rows=%s primary_rpc_count=%s primary_flush_parallelism=%s append_ms=%.3f primary_put_ms=%.3f primary_put_wall_ms=%.3f main_flush_ms=%.3f",
+            logger.info("[PIXELS_INSERT_INDEX_METRIC] file_id=%s rows=%s primary_rpc_count=%s primary_flush_parallelism=%s primary_flush_max_concurrency=%s append_ms=%.3f primary_put_ms=%.3f primary_put_wall_ms=%.3f main_flush_ms=%.3f",
                     fileId,
                     indexedRows,
                     primaryRpcCount,
                     effectivePrimaryFlushParallelism(),
+                    configuredPrimaryFlushMaxConcurrency(),
                     appendNanos / 1_000_000.0,
                     primaryPutNanos / 1_000_000.0,
                     primaryPutWallNanos / 1_000_000.0,
@@ -275,9 +283,17 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
             int end = Math.min(entries.size(), offset + maxEntries);
             List<IndexProto.PrimaryIndexEntry> chunk = entries.subList(offset, end);
             long start = System.nanoTime();
-            if (!indexService.putPrimaryIndexEntries(tableId, indexId, chunk,
-                    IndexOption.builder().vNodeId(-1).build())) {
-                throw new IOException("failed to write grouped Pixels INSERT primary index entries");
+            boolean permit = acquirePrimaryFlushPermit();
+            try {
+                if (!indexService.putPrimaryIndexEntries(tableId, indexId, chunk,
+                        IndexOption.builder().vNodeId(-1).build())) {
+                    throw new IOException("failed to write grouped Pixels INSERT primary index entries");
+                }
+            }
+            finally {
+                if (permit) {
+                    primaryFlushSemaphore.release();
+                }
             }
             primaryPutNanos += System.nanoTime() - start;
             primaryRpcCount++;
@@ -301,6 +317,36 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
     {
         return Math.max(1, Integer.getInteger(GROUPED_PRIMARY_WRITE_MAX_ENTRIES_PROPERTY,
                 DEFAULT_GROUPED_PRIMARY_WRITE_MAX_ENTRIES));
+    }
+
+    private static Semaphore createPrimaryFlushSemaphore()
+    {
+        int maxConcurrency = configuredPrimaryFlushMaxConcurrency();
+        return maxConcurrency > 0 ? new Semaphore(maxConcurrency) : null;
+    }
+
+    private static int configuredPrimaryFlushMaxConcurrency()
+    {
+        return Math.max(0, Integer.getInteger(PRIMARY_FLUSH_MAX_CONCURRENCY_PROPERTY,
+                DEFAULT_PRIMARY_FLUSH_MAX_CONCURRENCY));
+    }
+
+    private static boolean acquirePrimaryFlushPermit() throws IOException
+    {
+        if (primaryFlushSemaphore == null)
+        {
+            return false;
+        }
+        try
+        {
+            primaryFlushSemaphore.acquire();
+            return true;
+        }
+        catch (InterruptedException e)
+        {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while waiting for grouped primary-index RPC permit", e);
+        }
     }
 
     private int configuredPrimaryFlushParallelism()
