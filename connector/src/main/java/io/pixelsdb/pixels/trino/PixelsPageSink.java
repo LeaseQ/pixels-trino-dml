@@ -370,8 +370,327 @@ final class PixelsPageSink
             appendRepeated(target, column, ((RunLengthEncodedBlock) block).getValue(), length);
             return;
         }
-        for (int i = 0; i < length; i++) {
-            appendValue(target, column, block, offset + i);
+        Type type = column.getColumnType();
+        switch (column.getTypeCategory()) {
+            case BOOLEAN:
+                appendBooleanValues((BooleanColumnVector) target, type, block, offset, length);
+                break;
+            case BYTE:
+                appendByteValues((ByteColumnVector) target, type, block, offset, length);
+                break;
+            case SHORT:
+                appendShortValues((ShortColumnVector) target, type, block, offset, length);
+                break;
+            case INT:
+                appendIntValues((IntColumnVector) target, type, block, offset, length);
+                break;
+            case LONG:
+                appendLongValues((LongColumnVector) target, type, block, offset, length);
+                break;
+            case FLOAT:
+                appendFloatValues((FloatColumnVector) target, type, block, offset, length);
+                break;
+            case DOUBLE:
+                appendDoubleValues((DoubleColumnVector) target, type, block, offset, length);
+                break;
+            case DATE:
+                appendDateValues((DateColumnVector) target, type, block, offset, length);
+                break;
+            case TIME:
+                appendTimeValues((TimeColumnVector) target, type, block, offset, length);
+                break;
+            case TIMESTAMP:
+                appendTimestampValues((TimestampColumnVector) target, type, block, offset, length);
+                break;
+            case DECIMAL:
+                appendDecimalValues(target, (DecimalType) type, block, offset, length);
+                break;
+            case STRING:
+            case BINARY:
+            case VARBINARY:
+            case CHAR:
+            case VARCHAR:
+                appendSliceValues((BinaryColumnVector) target, type, block, offset, length);
+                break;
+            default:
+                for (int i = 0; i < length; i++) {
+                    appendValue(target, column, block, offset + i);
+                }
+        }
+    }
+
+    private static void appendBooleanValues(BooleanColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add(type.getBoolean(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add(type.getBoolean(block, i));
+            }
+        }
+    }
+
+    private static void appendByteValues(ByteColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add((byte) type.getLong(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add((byte) type.getLong(block, i));
+            }
+        }
+    }
+
+    private static void appendShortValues(ShortColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add((short) type.getLong(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add((short) type.getLong(block, i));
+            }
+        }
+    }
+
+    private static void appendIntValues(IntColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add((int) type.getLong(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add((int) type.getLong(block, i));
+            }
+        }
+    }
+
+    private static void appendLongValues(LongColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add(type.getLong(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add(type.getLong(block, i));
+            }
+        }
+    }
+
+    private static void appendFloatValues(FloatColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add((float) type.getDouble(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add((float) type.getDouble(block, i));
+            }
+        }
+    }
+
+    private static void appendDoubleValues(DoubleColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add(type.getDouble(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add(type.getDouble(block, i));
+            }
+        }
+    }
+
+    private static void appendDateValues(DateColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add((int) type.getLong(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add((int) type.getLong(block, i));
+            }
+        }
+    }
+
+    private static void appendTimeValues(TimeColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add((int) (type.getLong(block, i) / 1_000_000_000L));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add((int) (type.getLong(block, i) / 1_000_000_000L));
+            }
+        }
+    }
+
+    private static void appendTimestampValues(TimestampColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    target.add(type.getLong(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                target.add(type.getLong(block, i));
+            }
+        }
+    }
+
+    private static void appendDecimalValues(ColumnVector target, DecimalType type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (type.isShort()) {
+            DecimalColumnVector decimalTarget = (DecimalColumnVector) target;
+            if (block.mayHaveNull()) {
+                for (int i = offset; i < end; i++) {
+                    if (block.isNull(i)) {
+                        decimalTarget.addNull();
+                    }
+                    else {
+                        decimalTarget.add(type.getLong(block, i));
+                    }
+                }
+            }
+            else {
+                for (int i = offset; i < end; i++) {
+                    decimalTarget.add(type.getLong(block, i));
+                }
+            }
+        }
+        else {
+            LongDecimalColumnVector decimalTarget = (LongDecimalColumnVector) target;
+            if (block.mayHaveNull()) {
+                for (int i = offset; i < end; i++) {
+                    if (block.isNull(i)) {
+                        decimalTarget.addNull();
+                    }
+                    else {
+                        Int128 value = (Int128) type.getObject(block, i);
+                        decimalTarget.add(value.getHigh(), value.getLow());
+                    }
+                }
+            }
+            else {
+                for (int i = offset; i < end; i++) {
+                    Int128 value = (Int128) type.getObject(block, i);
+                    decimalTarget.add(value.getHigh(), value.getLow());
+                }
+            }
+        }
+    }
+
+    private static void appendSliceValues(BinaryColumnVector target, Type type, Block block,
+            int offset, int length)
+    {
+        int end = offset + length;
+        if (block.mayHaveNull()) {
+            for (int i = offset; i < end; i++) {
+                if (block.isNull(i)) {
+                    target.addNull();
+                }
+                else {
+                    appendSlice(target, type.getSlice(block, i));
+                }
+            }
+        }
+        else {
+            for (int i = offset; i < end; i++) {
+                appendSlice(target, type.getSlice(block, i));
+            }
         }
     }
 
