@@ -15,6 +15,7 @@ import io.trino.spi.block.LongArrayBlock;
 import io.trino.spi.connector.ConnectorMergeSink;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.BigintType;
+import io.trino.spi.type.DecimalType;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -99,6 +100,30 @@ class PixelsMergeSinkTest
         Page deletePage = updatePageWithOperation((byte) ConnectorMergeSink.DELETE_OPERATION_NUMBER, 11);
 
         assertThrows(TrinoException.class, () -> sink.storeMergedRows(deletePage));
+    }
+
+    @Test
+    void preservesDecimalScaleWhenEncodingMergeTags()
+    {
+        PixelsColumnHandle id = column("id", 0);
+        DecimalType decimalType = DecimalType.createDecimalType(18, 4);
+        PixelsColumnHandle amount = new PixelsColumnHandle(
+                "pixels", "default", "users", "amount", "amount", decimalType,
+                TypeDescription.Category.DECIMAL, "", 1);
+        RecordingTagIndex index = new RecordingTagIndex();
+        PixelsMergeSink sink = new PixelsMergeSink(mergeHandle(id, amount), index);
+
+        sink.storeMergedRows(new Page(
+                new LongArrayBlock(1, Optional.empty(), new long[] {11}),
+                new LongArrayBlock(1, Optional.empty(), new long[] {850000}),
+                new ByteArrayBlock(1, Optional.empty(), new byte[] {ConnectorMergeSink.UPDATE_OPERATION_NUMBER}),
+                new IntArrayBlock(1, Optional.empty(), new int[] {0}),
+                new LongArrayBlock(1, Optional.empty(), new long[] {11})));
+        sink.finish();
+
+        assertEquals(1, index.entries.size());
+        assertArrayEquals(TypeDescription.fromString("decimal(18,4)")
+                        .convertSqlStringToByte("85.0000"), index.entries.get(0).tag);
     }
 
     private static PixelsMergeTableHandle mergeHandle(PixelsColumnHandle id, PixelsColumnHandle label)

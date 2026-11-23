@@ -17,10 +17,14 @@ import io.trino.spi.Page;
 import io.trino.spi.TrinoException;
 import io.trino.spi.block.Block;
 import io.trino.spi.connector.ConnectorMergeSink;
+import io.trino.spi.type.DecimalType;
+import io.trino.spi.type.Int128;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TinyintType;
 
 import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -185,6 +189,22 @@ final class PixelsMergeSink implements ConnectorMergeSink
         else if (column.getTypeCategory() == TypeDescription.Category.BOOLEAN)
         {
             value = Boolean.toString(type.getBoolean(block, position));
+        }
+        else if (type instanceof DecimalType decimalType)
+        {
+            BigInteger unscaled;
+            if (decimalType.isShort())
+            {
+                unscaled = BigInteger.valueOf(decimalType.getLong(block, position));
+            }
+            else
+            {
+                Int128 int128 = (Int128) decimalType.getObject(block, position);
+                unscaled = new BigInteger(int128.toBigEndianBytes());
+            }
+            // Trino stores DECIMAL blocks as unscaled integers. Convert back
+            // to SQL-scale text before Pixels parses the tag.
+            value = new BigDecimal(unscaled, decimalType.getScale()).toPlainString();
         }
         else
         {
