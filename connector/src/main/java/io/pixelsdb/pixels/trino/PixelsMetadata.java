@@ -89,7 +89,9 @@ public class PixelsMetadata implements ConnectorMetadata
     private static final int PRIMARY_KEY_RESOLVE_BATCH_SIZE = Integer.getInteger(
             "pixels.update.primary-key-resolve-batch-size", 65_536);
     private static final int PRIMARY_KEY_RESOLVE_PARALLELISM = Math.max(1, Integer.getInteger(
-            "pixels.update.primary-key-resolve-parallelism", 1));
+            // Resolve independent primary-key batches concurrently; the system property remains
+            // available for deployments that need to cap IndexServer pressure.
+            "pixels.update.primary-key-resolve-parallelism", 16));
     private record PrimaryKeyResolution(long tableId, long indexId, List<PixelsColumnHandle> columns) {}
     private static final JsonCodec<ConnectorViewDefinition> ViewCodec =
             new JsonCodecFactory(new ObjectMapperProvider()).jsonCodec(ConnectorViewDefinition.class);
