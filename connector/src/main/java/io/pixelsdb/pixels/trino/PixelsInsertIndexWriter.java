@@ -6,6 +6,7 @@
 package io.pixelsdb.pixels.trino;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.UnsafeByteOperations;
 import io.airlift.log.Logger;
 import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.index.IndexOption;
@@ -125,7 +126,11 @@ final class PixelsInsertIndexWriter implements PixelsPageSink.InsertIndexWriter
         long start = System.nanoTime();
         try {
             for (int position = 0; position < batch.size; position++) {
-                ByteString key = ByteString.copyFrom(PrimaryKeyBytes.fromColumnVectors(
+                // PrimaryKeyBytes creates a fresh array for each row. It is never
+                // mutated after this point, so avoid copying it a second time into
+                // ByteString. This is especially important for the single-LONG PK
+                // used by the million-row INSERT fixture.
+                ByteString key = UnsafeByteOperations.unsafeWrap(PrimaryKeyBytes.fromColumnVectors(
                         primaryKeyTypes, batch.cols, primaryKeyOrdinals, position));
                 long rowId = rowIdAllocator.getRowId();
                 minRowId = Math.min(minRowId, rowId);
