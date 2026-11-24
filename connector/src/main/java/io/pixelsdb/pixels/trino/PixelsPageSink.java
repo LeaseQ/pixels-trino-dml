@@ -34,6 +34,7 @@ import io.trino.spi.type.Int128;
 import io.trino.spi.type.Type;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -774,9 +775,10 @@ final class PixelsPageSink
                 DecimalType decimalType = (DecimalType) type;
                 if (decimalType.isShort()) {
                     long decimalValue = decimalType.getLong(valueBlock, 0);
-                    for (int i = 0; i < length; i++) {
-                        ((DecimalColumnVector) target).add(decimalValue);
-                    }
+                    DecimalColumnVector decimalTarget = (DecimalColumnVector) target;
+                    int start = decimalTarget.getWriteIndex();
+                    Arrays.fill(decimalTarget.vector, start, start + length, decimalValue);
+                    decimalTarget.setWriteIndex(start + length);
                 }
                 else {
                     Int128 decimalValue = (Int128) decimalType.getObject(valueBlock, 0);
@@ -791,8 +793,19 @@ final class PixelsPageSink
             case CHAR:
             case VARCHAR:
                 Slice slice = type.getSlice(valueBlock, 0);
-                for (int i = 0; i < length; i++) {
-                    appendSlice((BinaryColumnVector) target, slice);
+                BinaryColumnVector binaryTarget = (BinaryColumnVector) target;
+                try {
+                    byte[] bytes = slice.byteArray();
+                    int start = binaryTarget.getWriteIndex();
+                    Arrays.fill(binaryTarget.vector, start, start + length, bytes);
+                    Arrays.fill(binaryTarget.start, start, start + length, slice.byteArrayOffset());
+                    Arrays.fill(binaryTarget.lens, start, start + length, slice.length());
+                    binaryTarget.setWriteIndex(start + length);
+                }
+                catch (UnsupportedOperationException e) {
+                    for (int i = 0; i < length; i++) {
+                        appendSlice(binaryTarget, slice);
+                    }
                 }
                 break;
             default:
