@@ -280,13 +280,41 @@ final class PixelsPageSink
         }
         int rowGroupId = writer.getNumRowGroup();
         int batchSize = rowBatch.size;
-        long writeStart = System.nanoTime();
-        writer.addRowBatch(rowBatch);
-        writeNanos += System.nanoTime() - writeStart;
+        long[] indexElapsed = new long[1];
+        CompletableFuture<IOException> indexFuture = null;
         if (indexWriter != null) {
-            long indexStart = System.nanoTime();
-            indexWriter.appendBatch(rowBatch, rowGroupId, currentRowGroupOffset);
-            indexNanos += System.nanoTime() - indexStart;
+            indexFuture = CompletableFuture.supplyAsync(() -> {
+                long indexStart = System.nanoTime();
+                try {
+                    indexWriter.appendBatch(rowBatch, rowGroupId, currentRowGroupOffset);
+                    return null;
+                }
+                catch (IOException e) {
+                    return e;
+                }
+                finally {
+                    indexElapsed[0] = System.nanoTime() - indexStart;
+                }
+            });
+        }
+        long writeStart = System.nanoTime();
+        IOException writerFailure = null;
+        try {
+            writer.addRowBatch(rowBatch);
+        }
+        catch (IOException e) {
+            writerFailure = e;
+        }
+        writeNanos += System.nanoTime() - writeStart;
+        IOException indexFailure = indexFuture == null ? null : indexFuture.join();
+        if (writerFailure != null) {
+            throw writerFailure;
+        }
+        if (indexFailure != null) {
+            throw indexFailure;
+        }
+        if (indexFuture != null) {
+            indexNanos += indexElapsed[0];
         }
         writtenRows += batchSize;
         flushCount++;
