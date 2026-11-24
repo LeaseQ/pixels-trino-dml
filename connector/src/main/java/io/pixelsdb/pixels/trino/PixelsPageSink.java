@@ -37,7 +37,6 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 
 import static io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_DATA_TYPE_ERROR;
 import static io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR;
@@ -86,6 +85,7 @@ final class PixelsPageSink
     private int currentRowGroupOffset;
     private long writtenRows;
     private long flushCount;
+    private long conversionNanos;
     private long writeNanos;
     private long indexNanos;
     private boolean finished;
@@ -165,6 +165,7 @@ final class PixelsPageSink
                     flush();
                 }
                 int rows = Math.min(page.getPositionCount() - position, rowBatch.freeSlots());
+                long conversionStart = System.nanoTime();
                 for (int channel = 0; channel < columns.size(); channel++) {
                     appendColumnValues(rowBatch.cols[channel], columns.get(channel),
                             page.getBlock(channel), position, rows);
@@ -174,6 +175,7 @@ final class PixelsPageSink
                     hidden.add(commitTimestamp);
                 }
                 rowBatch.size += rows;
+                conversionNanos += System.nanoTime() - conversionStart;
                 position += rows;
             }
         }
@@ -206,9 +208,10 @@ final class PixelsPageSink
                 indexWriter.finish();
             }
             finished = true;
-            logger.info("[PIXELS_INSERT_SINK_METRIC] rows=%s flush_count=%s write_ms=%.3f index_ms=%.3f",
+            logger.info("[PIXELS_INSERT_SINK_METRIC] rows=%s flush_count=%s conversion_ms=%.3f write_ms=%.3f index_ms=%.3f",
                     writtenRows,
                     flushCount,
+                    conversionNanos / 1_000_000.0,
                     writeNanos / 1_000_000.0,
                     indexNanos / 1_000_000.0);
             if (targetPathId >= 0 && fileName != null) {
@@ -281,75 +284,13 @@ final class PixelsPageSink
         }
         int rowGroupId = writer.getNumRowGroup();
         int batchSize = rowBatch.size;
-        long[] indexElapsed = new long[1];
-        CompletableFuture<IOException> indexFuture = null;
-        if (indexWriter != null) {
-            indexFuture = CompletableFuture.supplyAsync(() -> {
-                long indexStart = System.nanoTime();
-                try {
-                    indexWriter.appendBatch(rowBatch, rowGroupId, currentRowGroupOffset);
-                    return null;
-                }
-                catch (IOException e) {
-                    return e;
-                }
-                finally {
-                    indexElapsed[0] = System.nanoTime() - indexStart;
-                }
-            });
-        }
         long writeStart = System.nanoTime();
-        IOException writerFailure = null;
-        RuntimeException writerRuntimeFailure = null;
-        try {
-            writer.addRowBatch(rowBatch);
-        }
-        catch (IOException e) {
-            writerFailure = e;
-        }
-        catch (RuntimeException e) {
-            writerRuntimeFailure = e;
-        }
+        writer.addRowBatch(rowBatch);
         writeNanos += System.nanoTime() - writeStart;
-        IOException indexFailure = null;
-        RuntimeException indexRuntimeFailure = null;
-        if (indexFuture != null) {
-            try {
-                indexFailure = indexFuture.join();
-            }
-            catch (CompletionException e) {
-                Throwable cause = e.getCause();
-                if (cause instanceof RuntimeException) {
-                    indexRuntimeFailure = (RuntimeException) cause;
-                }
-                else if (cause instanceof Error) {
-                    throw (Error) cause;
-                }
-                else {
-                    throw e;
-                }
-            }
-        }
-        if (writerFailure != null) {
-            if (indexRuntimeFailure != null) {
-                writerFailure.addSuppressed(indexRuntimeFailure);
-            }
-            throw writerFailure;
-        }
-        if (writerRuntimeFailure != null) {
-            if (indexFailure != null) {
-                writerRuntimeFailure.addSuppressed(indexFailure);
-            }
-            if (indexRuntimeFailure != null) {
-                writerRuntimeFailure.addSuppressed(indexRuntimeFailure);
-            }
-            throw writerRuntimeFailure;
-        }
-        if (indexFailure != null) {
-            throw indexFailure;
-        }
-        if (indexFuture != null) {
-            indexNanos += indexElapsed[0];
+        if (indexWriter != null) {
+            long indexStart = System.nanoTime();
+            indexWriter.appendBatch(rowBatch, rowGroupId, currentRowGroupOffset);
+            indexNanos += System.nanoTime() - indexStart;
         }
         writtenRows += batchSize;
         flushCount++;

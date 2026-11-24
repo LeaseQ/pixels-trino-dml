@@ -19,15 +19,11 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 import static io.pixelsdb.pixels.core.TypeDescription.Category.LONG;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PixelsPageSinkTest
 {
@@ -160,30 +156,6 @@ class PixelsPageSinkTest
         assertEquals(List.of(true), cleanupCalls);
     }
 
-    @Test
-    void runtimeWriterFailureWaitsForTheOverlappedIndexBeforeAbort()
-            throws InterruptedException
-    {
-        RecordingWriter writer = new RecordingWriter(false, true);
-        RecordingInsertIndex index = new RecordingInsertIndex(false, true);
-        TypeDescription schema = TypeDescription.createSchemaFromStrings(
-                List.of("id"), List.of("long"));
-        PixelsPageSink sink = new PixelsPageSink(
-                writer, schema.createRowBatchWithHiddenColumn(2), List.of(column("id")),
-                1234L, 42L, "writer_file.pxl", index);
-
-        sink.appendPage(new Page(new LongArrayBlock(
-                1, Optional.empty(), new long[] {11L})));
-
-        CompletableFuture<Void> finish = CompletableFuture.runAsync(
-                () -> assertThrows(RuntimeException.class, sink::finish));
-        assertTrue(index.started.await(1, TimeUnit.SECONDS));
-        assertFalse(finish.isDone());
-        index.release.countDown();
-        finish.join();
-        assertTrue(index.appendCompleted);
-    }
-
     private static PixelsColumnHandle column(String name)
     {
         return new PixelsColumnHandle(
@@ -199,7 +171,6 @@ class PixelsPageSinkTest
         private int abortCount;
         private boolean aborted;
         private final boolean failOnClose;
-        private final boolean failOnAdd;
 
         private RecordingWriter()
         {
@@ -208,22 +179,12 @@ class PixelsPageSinkTest
 
         private RecordingWriter(boolean failOnClose)
         {
-            this(failOnClose, false);
-        }
-
-        private RecordingWriter(boolean failOnClose, boolean failOnAdd)
-        {
             this.failOnClose = failOnClose;
-            this.failOnAdd = failOnAdd;
         }
 
         @Override
         public boolean addRowBatch(VectorizedRowBatch rowBatch)
         {
-            if (failOnAdd)
-            {
-                throw new IllegalStateException("writer add failed");
-            }
             LongColumnVector valueVector = (LongColumnVector) rowBatch.cols[0];
             LongColumnVector timestampVector = (LongColumnVector) rowBatch.cols[1];
             List<Long> batchValues = new ArrayList<>();
@@ -293,10 +254,6 @@ class PixelsPageSinkTest
         private int finishCount;
         private int abortCount;
         private final boolean failOnFinish;
-        private final boolean blockAppend;
-        private final CountDownLatch started = new CountDownLatch(1);
-        private final CountDownLatch release = new CountDownLatch(1);
-        private volatile boolean appendCompleted;
 
         private RecordingInsertIndex()
         {
@@ -305,32 +262,12 @@ class PixelsPageSinkTest
 
         private RecordingInsertIndex(boolean failOnFinish)
         {
-            this(failOnFinish, false);
-        }
-
-        private RecordingInsertIndex(boolean failOnFinish, boolean blockAppend)
-        {
             this.failOnFinish = failOnFinish;
-            this.blockAppend = blockAppend;
         }
 
         @Override
         public void appendBatch(VectorizedRowBatch batch, int rowGroupId, int firstRowOffset)
         {
-            if (blockAppend)
-            {
-                started.countDown();
-                try
-                {
-                    release.await();
-                }
-                catch (InterruptedException e)
-                {
-                    Thread.currentThread().interrupt();
-                    throw new IllegalStateException("index append interrupted", e);
-                }
-                appendCompleted = true;
-            }
             LongColumnVector ids = (LongColumnVector) batch.cols[0];
             for (int position = 0; position < batch.size; position++)
             {
