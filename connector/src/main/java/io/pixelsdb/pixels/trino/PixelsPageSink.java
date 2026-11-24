@@ -37,6 +37,7 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 import static io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_DATA_TYPE_ERROR;
 import static io.pixelsdb.pixels.trino.exception.PixelsErrorCode.PIXELS_SQL_EXECUTE_ERROR;
@@ -299,16 +300,50 @@ final class PixelsPageSink
         }
         long writeStart = System.nanoTime();
         IOException writerFailure = null;
+        RuntimeException writerRuntimeFailure = null;
         try {
             writer.addRowBatch(rowBatch);
         }
         catch (IOException e) {
             writerFailure = e;
         }
+        catch (RuntimeException e) {
+            writerRuntimeFailure = e;
+        }
         writeNanos += System.nanoTime() - writeStart;
-        IOException indexFailure = indexFuture == null ? null : indexFuture.join();
+        IOException indexFailure = null;
+        RuntimeException indexRuntimeFailure = null;
+        if (indexFuture != null) {
+            try {
+                indexFailure = indexFuture.join();
+            }
+            catch (CompletionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException) {
+                    indexRuntimeFailure = (RuntimeException) cause;
+                }
+                else if (cause instanceof Error) {
+                    throw (Error) cause;
+                }
+                else {
+                    throw e;
+                }
+            }
+        }
         if (writerFailure != null) {
+            if (indexRuntimeFailure != null) {
+                writerFailure.addSuppressed(indexRuntimeFailure);
+            }
             throw writerFailure;
+        }
+        if (writerRuntimeFailure != null) {
+            if (indexFailure != null) {
+                writerRuntimeFailure.addSuppressed(indexFailure);
+            }
+            if (indexRuntimeFailure != null) {
+                writerRuntimeFailure.addSuppressed(indexRuntimeFailure);
+            }
+            throw writerRuntimeFailure;
         }
         if (indexFailure != null) {
             throw indexFailure;
