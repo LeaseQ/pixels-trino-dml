@@ -88,6 +88,8 @@ final class PixelsPageSink
     private long conversionNanos;
     private long writeNanos;
     private long indexNanos;
+    private long writerCloseNanos;
+    private long indexFinishNanos;
     private boolean finished;
     private boolean aborted;
 
@@ -203,17 +205,23 @@ final class PixelsPageSink
         }
         try {
             flush();
+            long writerCloseStart = System.nanoTime();
             writer.close();
+            writerCloseNanos += System.nanoTime() - writerCloseStart;
             if (indexWriter != null) {
+                long indexFinishStart = System.nanoTime();
                 indexWriter.finish();
+                indexFinishNanos += System.nanoTime() - indexFinishStart;
             }
             finished = true;
-            logger.info("[PIXELS_INSERT_SINK_METRIC] rows=%s flush_count=%s conversion_ms=%.3f write_ms=%.3f index_ms=%.3f",
+            logger.info("[PIXELS_INSERT_SINK_METRIC] rows=%s flush_count=%s conversion_ms=%.3f write_ms=%.3f index_ms=%.3f writer_close_ms=%.3f index_finish_ms=%.3f",
                     writtenRows,
                     flushCount,
                     conversionNanos / 1_000_000.0,
                     writeNanos / 1_000_000.0,
-                    indexNanos / 1_000_000.0);
+                    indexNanos / 1_000_000.0,
+                    writerCloseNanos / 1_000_000.0,
+                    indexFinishNanos / 1_000_000.0);
             if (targetPathId >= 0 && fileName != null) {
                 return CompletableFuture.completedFuture(List.of(
                         PixelsInsertFragment.encode(targetPathId, fileName, writer.getNumRowGroup(),
